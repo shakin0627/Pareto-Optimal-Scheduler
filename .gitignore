@@ -1,0 +1,14 @@
+# cache
+.fid_cache/
+.hf_cache/
+__pycache__/
+
+# outputs
+fid_out/
+samples/
+
+# editor
+.vscode/
+
+# python
+*.pyc
