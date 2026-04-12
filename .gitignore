@@ -12,3 +12,6 @@ samples/
 
 # python
 *.pyc
+
+
+.env

@@ -4,9 +4,15 @@ Usage:
     python run_inference.py --steps 20 --batch 16 --seed 42
 """
 import os
-os.environ["HF_TOKEN"] = "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"
 os.environ["HUGGINGFACE_HUB_CACHE"] = ".hf_cache"
 os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  
+
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 import argparse
 import torch
