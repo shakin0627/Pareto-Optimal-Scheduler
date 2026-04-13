@@ -1,16 +1,3 @@
-from __future__ import annotations
-
-import os
-os.environ["HUGGINGFACE_HUB_CACHE"] = ".hf_cache"
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-
-from dotenv import load_dotenv
-import os
-
-load_dotenv()  
-
-HF_TOKEN = os.getenv("HF_TOKEN")
-
 import math
 import warnings
 from pathlib import Path
@@ -19,6 +6,21 @@ from typing import Dict, List, Optional, Union, Callable
 import numpy as np
 import torch
 from scipy.interpolate import interp1d, PchipInterpolator
+"""
+BornSchedule v3 — optimal step scheduler for DPM-Solver-2.
+
+Cost functional (rank-1 decomposition of K_xi):
+
+  C = α²_{t_N} [ ρ_∞ (Σ_j A_j Γ_j)²          ← rank-1 cross-step coupling
+               + Σ_j Γ_j² V_j^res              ← residual kernel (φ^res, h² curvature)
+               + Σ_j Γ_j² D_j ]               ← discretization (h^6 penalty)
+    + barrier(h)                                ← log-barrier, prevents phantom steps
+
+Key choices vs earlier versions:
+  • V_j^res uses φ^res(a,b) = φ(a,b) − ρ_∞·a·b  (exact subtraction, no banded approx)
+    → preserves h² curvature for small h, prevents linear-objective collapse
+  • A_j = ∫ w_j(μ) σ_η(μ) dμ  (1-D quadrature, reuses sigma2_fn)
+"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VP-SDE helpers
@@ -197,7 +199,7 @@ def _compute_A_j(
         [sigma2_fn(float(m)) for m in mu_half], 0.0))
     int_half = float(np.trapezoid(np.exp(-mu_half) * sig_eta_half, mu_half))
 
-    return (al_j * int_full - c_k * al_s * int_half)
+    return al_j * int_full - c_k * al_s * int_half
 
 # ─────────────────────────────────────────────────────────────────────────────
 # V_j^res  —  residual kernel contribution
@@ -224,12 +226,9 @@ def _compute_V_res(
     lam_bar = 0.5 * (lam_prev + lam_curr)
 
     # lam_prev
-    prefactor = sigma2_fn(lam_bar) * math.exp(-2.0 * lam_prev) * (_alpha(lam_curr)**2)
-    # c_k       = (g_fn(lam_prev) / (2.0 * r1)) * _sigma_vp(lam_curr) * math.expm1(h)
-    
-    al_s = _alpha(lam_s)
-    I_full = math.exp(-lam_prev) - math.exp(-lam_curr)
-    c_k = (g_fn(lam_prev) / (2.0 * r1)) * al_s * I_full
+    prefactor = sigma2_fn(lam_bar) * math.exp(-2.0 * lam_prev)
+    c_k       = (g_fn(lam_prev) / (2.0 * r1)) * _sigma_vp(lam_curr) * math.expm1(h)
+    c_k       = (g_fn(lam_prev) / (2.0 * r1)) * _sigma_vp(lam_curr) * math.expm1(h)
 
     phi_h     = phi_res_fn(h,        h)
     phi_r1h   = phi_res_fn(r1 * h,   r1 * h)
@@ -307,37 +306,45 @@ def _cost_functional(
     r1: float = 0.5,
     n_quad: int = 32,
     barrier_weight: float = 0.0,
-    w_rank1: float = 1.0,   # rank-1 
-    w_vres:  float = 1.0,   # V_res 
-    w_disc:  float = 1.0,   # D_j 
 ) -> float:
-    N     = len(lambdas) - 1
-    h_arr = np.diff(lambdas)
+    """
+    C = α²_{t_N} [ ρ_∞ (Σ_j A_j Γ_j)²  +  Σ_j Γ_j² V_j^res  +  Σ_j Γ_j² D_j ]
+      − barrier_weight · Σ_j log(h_j / h_uniform)
+
+    barrier_weight > 0 adds a log-barrier that prevents phantom steps (h_j → 0).
+    It equals zero at the uniform schedule, so it does not bias the solution —
+    it only rules out the degenerate boundary of the feasible set.
+    """
+    N = len(lambdas) - 1
+    h_arr = np.diff(lambdas)                          # shape (N,)
 
     eps   = np.array([_compute_epsilon(lambdas[k-1], lambdas[k], g_fn, r1)
                       for k in range(1, N+1)])
     Gamma = _compute_gamma(eps, lambdas)
-    A     = np.array([_compute_A_j(lambdas[k-1], lambdas[k], sigma2_fn, g_fn, r1, n_quad)
-                      for k in range(1, N+1)])
-    Vres  = np.array([_compute_V_res(lambdas[k-1], lambdas[k], g_fn, sigma2_fn,
-                                     phi_res_fn, r1)
-                      for k in range(1, N+1)])
-    D     = np.array([_compute_D_j(lambdas[k-1], lambdas[k], g_fn, sigma2_gpp_fn, ell_gpp, r1)
-                      for k in range(1, N+1)])
+
+    # A    = np.array([_compute_A_j(lambdas[k-1], lambdas[k], sigma2_fn, n_quad)
+    #                  for k in range(1, N+1)])
+    A    = np.array([_compute_A_j(lambdas[k-1], lambdas[k], sigma2_fn, g_fn, r1, n_quad)
+                     for k in range(1, N+1)])
+    Vres = np.array([_compute_V_res(lambdas[k-1], lambdas[k], g_fn, sigma2_fn,
+                                    phi_res_fn, r1)
+                     for k in range(1, N+1)])
+    D    = np.array([_compute_D_j(lambdas[k-1], lambdas[k], g_fn, sigma2_gpp_fn, ell_gpp, r1)
+                     for k in range(1, N+1)])
 
     alpha_tN2  = _alpha(lambdas[-1]) ** 2
-    rank1_term = w_rank1 * rho_infty * float(np.dot(A, Gamma)) ** 2
-    vres_term  = w_vres  * float(np.dot(Vres, Gamma ** 2))
-    disc_term  = w_disc  * float(np.dot(D,    Gamma ** 2))
+    rank1_term = rho_infty * float(np.dot(A, Gamma)) ** 2
+    vres_term  = float(np.dot(Vres, Gamma ** 2))
+    disc_term  = float(np.dot(D,   Gamma ** 2))
     main_cost  = alpha_tN2 * (rank1_term + vres_term + disc_term)
 
     if barrier_weight > 0.0:
         h_uniform = (lambdas[-1] - lambdas[0]) / N
-        barrier   = -barrier_weight * float(np.sum(np.log(h_arr / h_uniform)))
+        # −β Σ log(h_j/h_uniform): zero at uniform, +∞ as any h_j→0
+        barrier = -barrier_weight * float(np.sum(np.log(h_arr / h_uniform)))
         return main_cost + barrier
 
     return main_cost
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -483,12 +490,7 @@ class OptimalSchedule:
         beta1: float = 0.9,
         beta2: float = 0.999,
         quad_pts: int = 64,
-        barrier_weight_scale: float = 0.005,
-        w_rank1: float = 1.0,       
-        w_vres:  float = 1.0,        
-        w_disc:  float = 1.0,        
-        ckpt_dir: Optional[str] = None,  
-        ckpt_every: int = 500,            
+        barrier_weight_scale: float = 0.000,
         verbose: bool = False,
         stats_override: Optional[dict] = None,
     ):
@@ -512,12 +514,6 @@ class OptimalSchedule:
         self.sigmas:              Optional[torch.Tensor] = None
         self.num_inference_steps: Optional[int]          = None
         self._lambdas_opt:        Optional[np.ndarray]   = None
-
-        self.w_rank1    = w_rank1
-        self.w_vres     = w_vres
-        self.w_disc     = w_disc
-        self.ckpt_dir   = ckpt_dir
-        self.ckpt_every = ckpt_every
 
     # ------------------------------------------------------------------
     # Stats loading
@@ -603,60 +599,34 @@ class OptimalSchedule:
     def _cost(self, lambdas: np.ndarray, barrier_weight: float = 0.0) -> float:
         return _cost_functional(
             lambdas,
-            g_fn=self.g_fn, sigma2_fn=self.sigma2_fn,
-            sigma2_gpp_fn=self.sigma2_gpp_fn, ell_gpp=self.ell_gpp,
-            phi_res_fn=self._phi_res_fn, rho_infty=self.rho_infty,
-            r1=self.r1, n_quad=self.quad_pts,
-            barrier_weight=barrier_weight,
-            w_rank1=self.w_rank1, w_vres=self.w_vres, w_disc=self.w_disc,
+            g_fn          = self.g_fn,
+            sigma2_fn     = self.sigma2_fn,
+            sigma2_gpp_fn = self.sigma2_gpp_fn,
+            ell_gpp       = self.ell_gpp,
+            phi_res_fn    = self._phi_res_fn,
+            rho_infty     = self.rho_infty,
+            r1            = self.r1,
+            n_quad        = self.quad_pts,
+            barrier_weight= barrier_weight,
         )
 
-    def _grad(self, interior, lam0, lamN, barrier_weight):
-        grad = np.zeros_like(interior)
-        kw = dict(
-            g_fn=self.g_fn, sigma2_fn=self.sigma2_fn,
-            sigma2_gpp_fn=self.sigma2_gpp_fn, phi_res_fn=self._phi_res_fn,
-            ell_gpp=self.ell_gpp, rho_infty=self.rho_infty, r1=self.r1,
-            barrier_weight=barrier_weight,
-            w_rank1=self.w_rank1, w_vres=self.w_vres, w_disc=self.w_disc,
+    def _grad(self,
+              interior: np.ndarray,
+              lam0: float, lamN: float,
+              barrier_weight: float) -> np.ndarray:
+        return _numerical_gradient(
+            interior, lam0, lamN,
+            g_fn          = self.g_fn,
+            sigma2_fn     = self.sigma2_fn,
+            sigma2_gpp_fn = self.sigma2_gpp_fn,
+            ell_gpp       = self.ell_gpp,
+            phi_res_fn    = self._phi_res_fn,
+            rho_infty     = self.rho_infty,
+            r1            = self.r1,
+            barrier_weight= barrier_weight,
+            fd_h          = self.fd_eps,
         )
-        fd_h = self.fd_eps
-        for i in range(len(interior)):
-            xp = interior.copy(); xp[i] += fd_h
-            xm = interior.copy(); xm[i] -= fd_h
-            Cp = _cost_functional(np.concatenate([[lam0], xp, [lamN]]), **kw)
-            Cm = _cost_functional(np.concatenate([[lam0], xm, [lamN]]), **kw)
-            grad[i] = (Cp - Cm) / (2.0 * fd_h)
-        return grad
-    
-    def _save_ckpt(self, it: int, interior: np.ndarray,
-                   lam0: float, lamN: float, cost: float) -> None:
-        import json
-        if self.ckpt_dir is None:
-            return
-        os.makedirs(self.ckpt_dir, exist_ok=True)
-        lams = np.concatenate([[lam0], interior, [lamN]])
-        npz_path = os.path.join(self.ckpt_dir, f"ckpt_iter{it:06d}.npz")
-        np.savez(npz_path,
-                 lambdas=lams,
-                 sigmas=self.lambda_to_sigma(lams),
-                 cost=np.array(cost),
-                 iter=np.array(it),
-                 w_rank1=np.array(self.w_rank1),
-                 w_vres=np.array(self.w_vres),
-                 w_disc=np.array(self.w_disc))
-        
-        json_path = os.path.join(self.ckpt_dir, f"ckpt_iter{it:06d}.json")
-        with open(json_path, "w") as f:
-            json.dump({
-                "iter": it,
-                "cost": float(cost),
-                "lambdas": lams.tolist(),
-                "sigmas": self.lambda_to_sigma(lams).tolist(),
-                "w_rank1": self.w_rank1,
-                "w_vres":  self.w_vres,
-                "w_disc":  self.w_disc,
-            }, f, indent=2)
+
     # ------------------------------------------------------------------
     # Optimisation
     # ------------------------------------------------------------------
@@ -699,9 +669,6 @@ class OptimalSchedule:
             if cost < best_cost:
                 best_cost, best_interior = cost, interior.copy()
 
-            if self.ckpt_dir and (it % self.ckpt_every == 0):
-                self._save_ckpt(it, interior, lam0, lamN, cost)
-                
             gnorm = float(np.linalg.norm(grad))
             if self.verbose and (it % max(1, self.max_iter // 10) == 0 or it == 1):
                 print(f"  iter {it:4d}  cost={cost:.4e}  |g|={gnorm:.3e}  lr={lr:.4e}")
@@ -719,218 +686,3 @@ class OptimalSchedule:
         self._lambdas_opt = lams_best
 
         return lams_best
-
-    def _print_cost_breakdown(self, lams: np.ndarray) -> None:
-        N     = len(lams) - 1
-        eps   = np.array([_compute_epsilon(lams[k-1], lams[k], self.g_fn, self.r1)
-                           for k in range(1, N+1)])
-        Gamma = _compute_gamma(eps, lams)
-        # A     = np.array([_compute_A_j(lams[k-1], lams[k], self.sigma2_fn, self.quad_pts)
-        #                   for k in range(1, N+1)])
-        A     = np.array([_compute_A_j(lams[k-1], lams[k], self.sigma2_fn, self.g_fn, self.r1, self.quad_pts)
-                          for k in range(1, N+1)])
-        Vres  = np.array([_compute_V_res(lams[k-1], lams[k], self.g_fn, self.sigma2_fn,
-                                         self._phi_res_fn, self.r1)
-                          for k in range(1, N+1)])
-        D     = np.array([_compute_D_j(lams[k-1], lams[k], self.g_fn, self.sigma2_gpp_fn, self.ell_gpp, self.r1)
-                          for k in range(1, N+1)])
-        a2    = _alpha(lams[-1]) ** 2
-        print(f"  Cost breakdown (× α²_{{t_N}} = {a2:.4f}):")
-        print(f"    rank-1  ρ_∞(ΣA_jΓ_j)² : {a2 * self.rho_infty * float(np.dot(A,Gamma))**2:.4e}")
-        print(f"    Σ Γ²_j V_j^res         : {a2 * float(np.dot(Vres, Gamma**2)):.4e}")
-        print(f"    Σ Γ²_j D_j             : {a2 * float(np.dot(D,    Gamma**2)):.4e}")
-
-    # ------------------------------------------------------------------
-    # diffusers-compatible interface
-    # ------------------------------------------------------------------
-
-    def set_timesteps(
-        self,
-        num_inference_steps: int,
-        device: Union[str, "torch.device", None] = None,
-    ) -> None:
-        N = num_inference_steps
-        if self.verbose:
-            print(f"[BornSchedule] optimising {N}-step schedule for '{self.model_name}'")
-
-        lambdas_opt       = self._optimise(N)
-        self._lambdas_opt = lambdas_opt
-
-        sigmas_np = self.lambda_to_sigma(lambdas_opt)
-        sigma_min = float(sigmas_np[-1])
-        sigma_max = float(sigmas_np[0])
-        t_np      = (sigmas_np - sigma_min) / (sigma_max - sigma_min + 1e-12) * 999.0
-
-        self.sigmas              = torch.tensor(sigmas_np, dtype=torch.float32, device=device)
-        self.timesteps           = torch.tensor(t_np,      dtype=torch.float32, device=device)
-        self.num_inference_steps = N
-
-    # ------------------------------------------------------------------
-    # Diagnostics
-    # ------------------------------------------------------------------
-
-    def get_lambdas(self) -> Optional[np.ndarray]:
-        return self._lambdas_opt
-
-    def cost_at_schedule(self) -> Optional[float]:
-        if self._lambdas_opt is None:
-            return None
-        return self._cost(self._lambdas_opt, barrier_weight=0.0)
-
-    def equidistribution_residuals(self) -> Optional[np.ndarray]:
-        """(V_j^res + D_j) · Γ_j² — uniform at KKT optimum."""
-        if self._lambdas_opt is None:
-            return None
-        lams  = self._lambdas_opt
-        N     = len(lams) - 1
-        eps   = np.array([_compute_epsilon(lams[k-1], lams[k], self.g_fn, self.r1)
-                           for k in range(1, N+1)])
-        Gamma = _compute_gamma(eps, lams)
-        Vres  = np.array([_compute_V_res(lams[k-1], lams[k], self.g_fn, self.sigma2_fn,
-                                         self._phi_res_fn, self.r1)
-                          for k in range(1, N+1)])
-        D     = np.array([_compute_D_j(lams[k-1], lams[k], self.g_fn, self.sigma2_gpp_fn, self.ell_gpp, self.r1)
-                          for k in range(1, N+1)])
-        return (Vres + D) * Gamma ** 2
-
-    def __repr__(self) -> str:
-        return (f"OptimalSchedule(model='{self.model_name}', r1={self.r1}, "
-                f"ρ_∞={self.rho_infty:.3f}, ℓ_corr={self.ell_corr:.4f}, "
-                f"steps={self.num_inference_steps})")
-
-if __name__ == "__main__":
-    import argparse
-    import time
-
-    parser = argparse.ArgumentParser(description="BornSchedule v2 - Verification & Diagnostics")
-    parser.add_argument("--model", type=str, default="stabilityai/stable-diffusion-2-1",
-                        help="Model name registered in stats (e.g. 'stabilityai/stable-diffusion-2-1')")
-    parser.add_argument("--steps", type=int, default=5,
-                        help="Number of inference steps to optimize")
-    parser.add_argument("--r1", type=float, default=0.5,
-                        help="DPM-Solver-2 parameter r1")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print detailed optimization logs")
-    parser.add_argument("--plot", action="store_true",
-                        help="Plot lambda schedule, sigmas and equidistribution residuals")
-    parser.add_argument("--stats-dir", type=str, default=None,
-                        help="Override stats search directory")
-    
-    args = parser.parse_args()
-
-    # Optional: override stats directory via env
-    if args.stats_dir:
-        os.environ["OPT_SCHEDULE_STATS_DIR"] = args.stats_dir
-
-    print("=" * 80)
-    print("BornSchedule v2  —  Verification")
-    print("=" * 80)
-    print(f"Model          : {args.model}")
-    print(f"Steps          : {args.steps}")
-    print(f"r1             : {args.r1}")
-    print(f"ρ_∞ / ℓ_corr   : will be auto-extracted from stats")
-    print("-" * 80)
-
-    start_time = time.time()
-
-    # ====================== 1. Create scheduler ======================
-    scheduler = OptimalSchedule(
-        model_name=args.model,
-        r1=args.r1,
-        max_iter=3000,
-        lr=1e-2,
-        lr_decay=0.999,
-        tol=1e-6,
-        fd_eps=5e-6,
-        verbose=args.verbose,
-    )
-
-    print(f"Loaded stats for '{args.model}'")
-    print(f"λ range        : [{scheduler.lambda_min:.4f}, {scheduler.lambda_max:.4f}]")
-    print(f"ρ_∞            : {scheduler.rho_infty:.5f}")
-    print(f"ℓ_corr         : {scheduler.ell_corr:.5f}")
-
-    # ====================== 2. Optimize schedule ======================
-    print("\n[1/3] Optimizing Born schedule...")
-    scheduler.set_timesteps(num_inference_steps=args.steps)
-
-    opt_time = time.time() - start_time
-    print(f"Optimization finished in {opt_time:.2f}s")
-
-    # ====================== 3. Diagnostics ======================
-    print("\n[2/3] Diagnostics:")
-    lambdas = scheduler.get_lambdas()
-    cost    = scheduler.cost_at_schedule()
-
-    print(f"Final cost functional C = {cost:.6e}")
-    print(f"λ nodes ({args.steps+1} points):")
-    for i, lam in enumerate(lambdas):
-        print(f"  {i:2d}: λ = {lam:8.5f}   σ = {scheduler.lambda_to_sigma(lam):8.5f}")
-
-    # Equidistribution check (should be roughly flat at optimum)
-    residuals = scheduler.equidistribution_residuals()
-    if residuals is not None:
-        mean_res = float(np.mean(residuals))
-        std_res  = float(np.std(residuals))
-        print(f"\nEquidistribution residuals (V_res + D)·Γ²:")
-        print(f"  Mean = {mean_res:.4e}   Std = {std_res:.4e}   CV = {std_res/mean_res*100:.2f}%")
-
-        # Check uniformity quality
-        if std_res / mean_res < 0.25:
-            print("  → Excellent uniformity (CV < 25%)")
-        elif std_res / mean_res < 0.40:
-            print("  → Good uniformity")
-        else:
-            print("  → Moderate uniformity — consider more iterations or smaller fd_eps")
-
-    # ====================== 4. Optional Plot ======================
-    if args.plot:
-        try:
-            import matplotlib.pyplot as plt
-            print("\n[3/3] Generating plots...")
-
-            fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-
-            # 1. Lambda schedule
-            axs[0,0].plot(lambdas, 'o-', label='Optimized λ')
-            axs[0,0].set_title('Optimized λ Schedule')
-            axs[0,0].set_xlabel('Step index')
-            axs[0,0].set_ylabel('λ (log-SNR)')
-            axs[0,0].grid(True, alpha=0.3)
-
-            # 2. Sigma schedule
-            sigmas = scheduler.lambda_to_sigma(lambdas)
-            axs[0,1].plot(sigmas, 'o-', color='orange', label='σ(t)')
-            axs[0,1].set_title('Sigma Schedule')
-            axs[0,1].set_xlabel('Step index')
-            axs[0,1].set_ylabel('σ')
-            axs[0,1].grid(True, alpha=0.3)
-
-            # 3. Equidistribution residuals
-            axs[1,0].plot(residuals, 'o-', color='green')
-            axs[1,0].axhline(mean_res, color='red', linestyle='--', alpha=0.7, label=f'Mean = {mean_res:.2e}')
-            axs[1,0].set_title('Equidistribution Residuals (should be flat)')
-            axs[1,0].set_xlabel('Step index')
-            axs[1,0].set_ylabel('(V^res_j + D_j) Γ_j²')
-            axs[1,0].legend()
-            axs[1,0].grid(True, alpha=0.3)
-
-            # 4. Cumulative contribution
-            cum_contrib = np.cumsum(residuals[::-1])[::-1] / np.sum(residuals)
-            axs[1,1].plot(cum_contrib, 'o-', color='purple')
-            axs[1,1].set_title('Cumulative Error Contribution')
-            axs[1,1].set_xlabel('Step index (from noisy → clean)')
-            axs[1,1].set_ylabel('Cumulative fraction')
-            axs[1,1].grid(True, alpha=0.3)
-
-            plt.tight_layout()
-            plt.show()
-
-        except ImportError:
-            print("Matplotlib not available, skipping plots.")
-
-    total_time = time.time() - start_time
-    print("\n" + "="*80)
-    print(f"Verification completed successfully in {total_time:.2f}s")
-    print(f"OptimalSchedule ready for use with {args.steps} steps.")
-    print("="*80)
