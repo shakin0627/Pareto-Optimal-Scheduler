@@ -209,7 +209,7 @@ def compute_fid(img_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--nfe",      type=int,   nargs="+", default=[12],
+    parser.add_argument("--nfe",      type=int,   nargs="+", default=[20],
                         help="NFE values to benchmark (must be even)")
     parser.add_argument("--n_images", type=int,   default=10000)
     parser.add_argument("--batch",    type=int,   default=16)
@@ -219,7 +219,7 @@ def main():
                         help="Keep generated PNGs after FID (default: delete)")
     # BornSchedule optimiser knobs
     parser.add_argument("--max_iter", type=int,   default=4000)
-    parser.add_argument("--lr",       type=float, default=1e-3)
+    parser.add_argument("--lr",       type=float, default=1e-2)
     parser.add_argument("--tol",      type=float, default=1e-7)
     args = parser.parse_args()
 
