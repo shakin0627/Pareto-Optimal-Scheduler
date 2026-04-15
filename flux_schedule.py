@@ -7,10 +7,6 @@ Cost functional (FM Euler, empirically validated):
     + w_vres  ·        Σ_j γ_j² · V_j^res    [residual score variance]
     + w_disc  ·        Σ_j γ_j² · D_j        [discretisation variance]
 
-Note: the discretisation kernel ρ_∞^d ≈ 0 empirically (v̇ errors are
-weakly correlated across steps), so the rank-1 disc term is dropped.
-D_j enters only as a local diagonal term.
-
 Definitions (FM / Euler):
   h_j   = σ_{j−1} − σ_j  > 0            (step size; σ decreasing)
   ε_k   = h_k · g(σ_{k−1}) · (−1)       (propagator correction; g≈0 for FM)
@@ -175,7 +171,6 @@ def _compute_D_j(sigma_prev: float, sigma_curr: float,
 
     ρ_∞^d ≈ 0 empirically: v̇ errors decorrelate across steps,
     so no rank-1 disc term appears in the cost functional.
-    D_j enters only as a local diagonal term Γ_j² · D_j.
     """
     h_abs = sigma_prev - sigma_curr
     return (h_abs**4 / 4.0) * max(sigma2_vdot_fn(sigma_prev), 0.0)
@@ -308,15 +303,42 @@ def compute_importance_scores(
 # Stats helper
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _extract_rho_infty(rho_s: np.ndarray, rho_vals: np.ndarray) -> float:
-    tail_start = max(1, int(0.80 * len(rho_vals)))
-    ri   = float(np.clip(np.median(rho_vals[tail_start:]), 0.0, 1.0 - 1e-6))
-    tail = rho_vals[tail_start:]
-    if np.std(tail) / (np.mean(tail) + 1e-8) > 0.1:
-        warnings.warn("[flux_schedule] rho tail not converged — extend rho_s range.",
-                      UserWarning)
-    return ri
+def _extract_rho_infty(
+    rho_s: np.ndarray,
+    rho_vals: np.ndarray,
+) -> float:
+    drho     = np.abs(np.diff(rho_vals))
+    rel_drho = drho / (np.abs(rho_vals[:-1]) + 1e-8)
+    MIN_FLAT = max(5, len(rho_vals) // 10)
 
+    plateau_start = None
+    for i in range(len(rel_drho) - MIN_FLAT + 1):
+        if np.all(rel_drho[i : i + MIN_FLAT] < 0.02):
+            plateau_start = i
+            break
+    if plateau_start is None:
+        warnings.warn("[flux_schedule] No plateau found — extend rho_s range.", UserWarning)
+        plateau_start = len(rho_vals) // 2
+
+    rho_at_start = rho_vals[plateau_start]
+    plateau_end  = len(rho_vals)
+    for i in range(plateau_start + MIN_FLAT, len(rho_vals)):
+        if rho_vals[i] < rho_at_start * 0.95:
+            plateau_end = i
+            break
+
+    plateau_vals = rho_vals[plateau_start:plateau_end]
+    ri = float(np.clip(np.median(plateau_vals), 0.0, 1.0 - 1e-6))
+
+    cv = np.std(plateau_vals) / (np.mean(plateau_vals) + 1e-8)
+    if cv > 0.05:
+        warnings.warn(
+            f"[flux_schedule] Plateau CV={cv:.3f} — ρ_∞ estimate unreliable. "
+            f"Detected plateau: indices [{plateau_start}, {plateau_end}), "
+            f"s=[{rho_s[plateau_start]:.3f}, {rho_s[min(plateau_end, len(rho_s)-1)]:.3f}].",
+            UserWarning,
+        )
+    return ri
 
 def _load_stats(npz_path: str):
     """Load stats npz, return interpolators and rho_infty."""

@@ -2,8 +2,8 @@
 BornSchedule vs uniform-logSNR FID comparison on google/ddpm-cifar10-32
 
 Usage:
-    python run_fid.py --nfe 10 --n_images 10000 --batch 16 --seed 42
-    python run_fid.py --nfe 5 10 20 --n_images 10000 --batch 64
+    python benchmark.py --nfe 10 --n_images 10000 --batch 16 --seed 42
+    python benchmark.py --nfe 5 10 20 --n_images 10000 --batch 64
 """
 
 import os, gc, shutil, argparse
@@ -17,7 +17,7 @@ from PIL import Image
 from torchvision.utils import make_grid
 
 from dpm_solver import NoiseScheduleVP, model_wrapper, DPM_Solver
-from scheduling_born import OptimalSchedule, _cost_functional
+from opt_schedule import OptimalSchedule, _cost_functional
 from diffusers import DDPMPipeline
 
 import lpips

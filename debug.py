@@ -1,15 +1,15 @@
 """
-sweep_born.py  v2 — checkpoint-based FID sweep
+debug.py  — checkpoint-based FID sweep
 ================================================
 
 Usage
 ----
-python sweep_born.py --nfe 12 --n_images 2000 --ckpt_every 500
+python debug.py --nfe 12 --n_images 2000 --ckpt_every 500
 
-python sweep_born.py --nfe 8 10 12 --n_images 5000 \\
+python debug.py --nfe 8 10 12 --n_images 5000 \\
     --lr_list 3e-3 1e-3 3e-4 --max_iter_list 4000 8000
 
-python sweep_born.py --nfe 12 --lr_list 1e-3 --max_iter_list 8000 \\
+python debug.py --nfe 12 --lr_list 1e-3 --max_iter_list 8000 \\
     --seeds 0 1 2 --n_images 5000
 """
 
@@ -171,7 +171,7 @@ def _reload(unet, device):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 单次 run
+# single run
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_one(
@@ -197,7 +197,6 @@ def run_one(
     )
     ckpt_results: list[CkptResult] = []
 
-    # ── 1. 优化 ────────────────────────────────────────────────────────────
     try:
         torch.manual_seed(seed); np.random.seed(seed)
         born = OptimalSchedule(
@@ -208,7 +207,7 @@ def run_one(
         )
         K = nfe // 2
         try:
-            born._optimise_with_hooks(K)   # 带梯度记录
+            born._optimise_with_hooks(K)   
         except AttributeError:
             born._optimise(K)              # fallback
 
@@ -223,7 +222,7 @@ def run_one(
         summary.error_msg = f"optimise: {e}"
         return summary, ckpt_results
 
-    # ── 2. Baseline FID（只算一次） ────────────────────────────────────────
+    # Baseline FID
     base_dir = work_dir / tag / "baseline"
     try:
         print(f"    [baseline] generating {n_images} imgs…")
@@ -240,11 +239,10 @@ def run_one(
         if not keep_imgs and base_dir.exists():
             shutil.rmtree(base_dir)
 
-    # ── 3. 对每个 checkpoint 测 FID ───────────────────────────────────────
+    # FID 
     def ckpt_sort_key(p):
         n = int(p.stem.replace("ckpt_iter", ""))
-        return (1, 0) if n < 0 else (0, n)   # 负号（final）排最后
-
+        return (1, 0) if n < 0 else (0, n)   
     ckpt_files = sorted(ckpt_dir.glob("ckpt_iter*.npz"), key=ckpt_sort_key)
     if not ckpt_files:
         summary.error_msg += " | no_ckpts"
@@ -322,10 +320,6 @@ def append_csv(path: Path, obj, cols):
         if write_header: w.writeheader()
         w.writerow({k: d.get(k, "") for k in cols})
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 打印
-# ─────────────────────────────────────────────────────────────────────────────
 
 def print_run_summary(s: RunSummary):
     conv = "✓" if s.converged else "✗"

@@ -324,7 +324,7 @@ def est_rho_vdot(tr, sigma_grid, x0, enc1, pool1, img1, txt1,
 # Utility functions (model-agnostic, mirrored from stats_cifar10.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _extract_rho_curve(dl, rho, n_bins=40, anchor_at_one=True):
+def _extract_rho_curve(dl, rho, n_bins=40, anchor_at_one=False):
     valid = dl > 0
     if valid.sum() < 5:
         return np.linspace(0, 1, 5), np.ones(5)

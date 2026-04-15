@@ -1,22 +1,17 @@
 """
 patch_vdot_fd1.py  —  Recompute v̇ statistics using FIRST-ORDER central difference.
 
-理论依据:
   D_j = E‖dv_θ/dt‖²/d
   dv_θ/dt ≈ [v_θ(x_{σ+dσ}, σ+dσ) − v_θ(x_{σ−dσ}, σ−dσ)] / (2·dσ)
 
-原 stats_flux.py 用的是 (v_hi − 2v_mid + v_lo)/dσ² (二阶差分, 加速度),
-本脚本修正为一阶中心差分。
 
-输出: 在原 .npz 旁边创建备份，然后 patch 进以下新 key：
+New keys:
   sigma2_vdot_fd1      : σ²_v̇(σ) 一阶修正值 (平滑后)
   sigma2_gpp_values_fd1: 同上 (born_schedule.py 兼容别名)
   rho_s_vdot_fd1       : ρ̂_v̇ 插值 x 轴
   rho_values_vdot_fd1  : ρ̂_v̇ 插值 y 轴
 
-所有原始 key 完全保留，不删除不覆盖。
-
-用法:
+Usage:
   python patch_vdot_fd1.py \\
       --npz ~/.cache/opt_schedule/black-forest-labs--FLUX.1-dev.npz \\
       --model black-forest-labs/FLUX.1-dev \\
@@ -107,8 +102,6 @@ def flux_vel(tr, x_t, sigma, enc, pool, img_ids, txt_ids, h, w,
 
 # ══════════════════════════════════════════════════════════════════════════════
 # σ²_v̇(σ) — 一阶中心差分  dv_θ/dt ≈ (v_hi − v_lo) / (2·dσ)
-#
-# 注: x_lo/x_hi 路径一致 (同一 x₀ 和 ε), 消除随机噪声偏差
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -335,7 +328,7 @@ def run(args):
     np.save(str(rhomat_path), rho_mat_vd.astype(np.float32))
     print(f"  rho_mat (v̇ fd1) → {rhomat_path}")
 
-    # ── 简要汇总 ──────────────────────────────────────────────────────────────
+    # ── Summary ──────────────────────────────────────────────────────────────
     print("\n══ Patch Summary ══════════════════════════════════════════")
     print(f"  σ²_v̇(fd1) range : [{s2_vdot_fd1_sm.min():.3e}, {s2_vdot_fd1_sm.max():.3e}]")
     print(f"  ρ_∞(v̇ fd1)     : {plateau_vd['rho_infty']:.4f}  "

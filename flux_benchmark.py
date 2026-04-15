@@ -231,20 +231,17 @@ class FluxCustomSchedule:
         width:  int = 512,
         guidance_scale: float = 3.5,
     ) -> tuple[Image.Image, float]:
-        """
-        Returns (PIL image, latency_seconds).
-        Injects custom sigmas into FlowMatchEulerDiscreteScheduler.
-        """
+        import copy, torch
         from diffusers import FlowMatchEulerDiscreteScheduler
-        import copy
 
         nfe = len(sigmas) - 1
 
-        # Clone the scheduler and inject custom sigmas (timesteps in σ-space)
-        sched = copy.deepcopy(self.pipe.scheduler)
+        orig_sched = self.pipe.scheduler          
+        sched = copy.deepcopy(orig_sched)
         ts = torch.tensor(sigmas, dtype=torch.float32)
         sched.timesteps = ts
         sched.sigmas    = ts
+        self.pipe.scheduler = sched               
 
         gen = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -255,10 +252,11 @@ class FluxCustomSchedule:
             guidance_scale=guidance_scale,
             height=height, width=width,
             generator=gen,
-            scheduler=sched,     # type: ignore[arg-type]
             output_type="pil",
         )
         latency = time.perf_counter() - t0
+
+        self.pipe.scheduler = orig_sched          
         return out.images[0], latency
 
 

@@ -390,31 +390,70 @@ def _project_ordering(
 # Stats helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# def _extract_rho_infty_and_ell(
+#     rho_s: np.ndarray,
+#     rho_vals: np.ndarray,
+# ) -> tuple:
+#     """
+#     ρ_∞   : median of the last 20% of rho_vals (tail plateau).
+#     ℓ_corr: s where normalised residual (ρ−ρ_∞)/(1−ρ_∞) first hits 1/e.
+#     """
+#     tail_start = max(1, int(0.80 * len(rho_vals)))
+#     rho_infty  = float(np.median(rho_vals[tail_start:]))
+#     rho_infty  = np.clip(rho_infty, 0.0, 1.0 - 1e-6)
+#     tail_vals = rho_vals[tail_start:]
+#     if np.std(tail_vals) / (np.mean(tail_vals) + 1e-8) > 0.1:
+#         warnings.warn(
+#             f"[BornSchedule] rho tail not converged (CV={np.std(tail_vals)/np.mean(tail_vals):.2f}). "
+#             f"Extend rho_s range in estimate_model_stats.py.",
+#             UserWarning,
+#         )
+#     denom   = max(1.0 - rho_infty, 1e-8)
+#     rho_res = np.clip((rho_vals - rho_infty) / denom, 0.0, 1.0)
+#     cross   = np.where(rho_res <= 1.0 / math.e)[0]
+#     ell_corr = float(rho_s[cross[0]]) if len(cross) > 0 else float(rho_s[-1])
+
+#     return rho_infty, ell_corr
+
 def _extract_rho_infty_and_ell(
     rho_s: np.ndarray,
     rho_vals: np.ndarray,
 ) -> tuple:
-    """
-    ρ_∞   : median of the last 20% of rho_vals (tail plateau).
-    ℓ_corr: s where normalised residual (ρ−ρ_∞)/(1−ρ_∞) first hits 1/e.
-    """
-    tail_start = max(1, int(0.80 * len(rho_vals)))
-    rho_infty  = float(np.median(rho_vals[tail_start:]))
-    rho_infty  = np.clip(rho_infty, 0.0, 1.0 - 1e-6)
-    tail_vals = rho_vals[tail_start:]
-    if np.std(tail_vals) / (np.mean(tail_vals) + 1e-8) > 0.1:
-        warnings.warn(
-            f"[BornSchedule] rho tail not converged (CV={np.std(tail_vals)/np.mean(tail_vals):.2f}). "
-            f"Extend rho_s range in estimate_model_stats.py.",
-            UserWarning,
-        )
-    denom   = max(1.0 - rho_infty, 1e-8)
-    rho_res = np.clip((rho_vals - rho_infty) / denom, 0.0, 1.0)
-    cross   = np.where(rho_res <= 1.0 / math.e)[0]
+    drho     = np.abs(np.diff(rho_vals))
+    rel_drho = drho / (np.maximum(np.abs(rho_vals[:-1]), 0.05))
+    MIN_FLAT = max(5, len(rho_vals) // 10)
+    
+    plateau_start = None
+    for i in range(len(rel_drho) - MIN_FLAT + 1):
+        if np.all(rel_drho[i : i + MIN_FLAT] < 0.02):
+            plateau_start = i
+            break
+    if plateau_start is None:
+        warnings.warn("[BornSchedule] No plateau found — extend rho_s range.", UserWarning)
+        plateau_start = int(0.5 * len(rho_vals))  # fallback
+
+    rho_at_start = rho_vals[plateau_start]
+    plateau_end  = len(rho_vals)  # default: no slow decay
+    for i in range(plateau_start + MIN_FLAT, len(rho_vals)):
+        if rho_vals[i] < rho_at_start * 0.95:
+            plateau_end = i
+            break
+
+    mid = plateau_start + (plateau_end - plateau_start) // 2
+    plateau_vals = rho_vals[plateau_start:mid]
+    rho_infty    = float(np.clip(np.median(plateau_vals), 0.0, 1.0 - 1e-6))
+
+    cv = np.std(plateau_vals) / (np.mean(plateau_vals) + 1e-8)
+    if cv > 0.05:
+        warnings.warn(f"[BornSchedule] Plateau CV={cv:.3f} high, ρ_∞ unreliable.", UserWarning)
+
+    denom    = max(1.0 - rho_infty, 1e-8)
+    rho_res  = (rho_vals - rho_infty) / denom
+    rho_res  = np.maximum(rho_res, 0.0)
+    cross    = np.where(rho_res <= 1.0 / math.e)[0]
     ell_corr = float(rho_s[cross[0]]) if len(cross) > 0 else float(rho_s[-1])
 
     return rho_infty, ell_corr
-
 
 _STATS_SEARCH_PATHS = [
     Path(os.environ.get("OPT_SCHEDULE_STATS_DIR", ".")),
@@ -719,7 +758,84 @@ class OptimalSchedule:
         self._lambdas_opt = lams_best
 
         return lams_best
-
+    
+    def _optimise_with_hooks(
+        self,
+        N: int,
+        capture_steps: int = 10,   
+    ) -> np.ndarray:
+        """
+        same as _optimise
+        """
+        lam0      = self.lambda_min
+        lamN      = self.lambda_max
+        h_uniform = (lamN - lam0) / N
+        min_gap   = h_uniform / 5.0
+ 
+        interior = np.linspace(lam0, lamN, N + 1)[1:-1].copy()
+ 
+        cost_uniform   = self._cost(np.linspace(lam0, lamN, N + 1), barrier_weight=0.0)
+        barrier_weight = self.barrier_weight_scale * cost_uniform / N
+ 
+        if self.verbose:
+            print(f"  [BornSchedule] N={N}  C(uniform)={cost_uniform:.4e}  "
+                  f"barrier_weight={barrier_weight:.3e}")
+ 
+        m, v  = np.zeros_like(interior), np.zeros_like(interior)
+        lr    = self.lr
+ 
+        best_cost     = np.inf
+        best_interior = interior.copy()
+ 
+        grad_history: list[float] = []
+ 
+        for it in range(1, self.max_iter + 1):
+            grad = self._grad(interior, lam0, lamN, barrier_weight)
+            gnorm = float(np.linalg.norm(grad))
+            grad_history.append(gnorm)
+ 
+            m  = self.beta1 * m + (1.0 - self.beta1) * grad
+            v  = self.beta2 * v + (1.0 - self.beta2) * grad ** 2
+            mh = m / (1.0 - self.beta1 ** it)
+            vh = v / (1.0 - self.beta2 ** it)
+            interior = interior - lr * mh / (np.sqrt(vh) + 1e-8)
+            interior = _project_ordering(interior, lam0, lamN, min_gap)
+ 
+            cost = self._cost(np.concatenate([[lam0], interior, [lamN]]),
+                              barrier_weight)
+            if cost < best_cost:
+                best_cost, best_interior = cost, interior.copy()
+ 
+            # checkpoint
+            if self.ckpt_dir and (it % self.ckpt_every == 0):
+                self._save_ckpt(it, interior, lam0, lamN, cost)
+ 
+            if self.verbose and (it % max(1, self.max_iter // 10) == 0 or it == 1):
+                print(f"  iter {it:4d}  cost={cost:.4e}  |g|={gnorm:.3e}  lr={lr:.4e}")
+ 
+            if gnorm < self.tol:
+                if self.verbose:
+                    print(f"  converged  iter={it}  |g|={gnorm:.3e}")
+                break
+ 
+            lr *= self.lr_decay
+ 
+        lams_best = np.concatenate([[lam0], best_interior, [lamN]])
+ 
+        if self.ckpt_dir:
+            self._save_ckpt(-1, best_interior, lam0, lamN, best_cost)
+ 
+        if self.verbose:
+            self._print_cost_breakdown(lams_best)
+ 
+        self.grad_history    = grad_history
+        self.final_grad_norm = grad_history[-1] if grad_history else float("nan")
+        self.n_iter_actual   = len(grad_history)
+        self.converged       = (grad_history[-1] < self.tol) if grad_history else False
+        self._lambdas_opt    = lams_best
+ 
+        return lams_best
+    
     def _print_cost_breakdown(self, lams: np.ndarray) -> None:
         N     = len(lams) - 1
         eps   = np.array([_compute_epsilon(lams[k-1], lams[k], self.g_fn, self.r1)
@@ -798,139 +914,3 @@ class OptimalSchedule:
                 f"ρ_∞={self.rho_infty:.3f}, ℓ_corr={self.ell_corr:.4f}, "
                 f"steps={self.num_inference_steps})")
 
-if __name__ == "__main__":
-    import argparse
-    import time
-
-    parser = argparse.ArgumentParser(description="BornSchedule v2 - Verification & Diagnostics")
-    parser.add_argument("--model", type=str, default="stabilityai/stable-diffusion-2-1",
-                        help="Model name registered in stats (e.g. 'stabilityai/stable-diffusion-2-1')")
-    parser.add_argument("--steps", type=int, default=5,
-                        help="Number of inference steps to optimize")
-    parser.add_argument("--r1", type=float, default=0.5,
-                        help="DPM-Solver-2 parameter r1")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print detailed optimization logs")
-    parser.add_argument("--plot", action="store_true",
-                        help="Plot lambda schedule, sigmas and equidistribution residuals")
-    parser.add_argument("--stats-dir", type=str, default=None,
-                        help="Override stats search directory")
-    
-    args = parser.parse_args()
-
-    # Optional: override stats directory via env
-    if args.stats_dir:
-        os.environ["OPT_SCHEDULE_STATS_DIR"] = args.stats_dir
-
-    print("=" * 80)
-    print("BornSchedule v2  —  Verification")
-    print("=" * 80)
-    print(f"Model          : {args.model}")
-    print(f"Steps          : {args.steps}")
-    print(f"r1             : {args.r1}")
-    print(f"ρ_∞ / ℓ_corr   : will be auto-extracted from stats")
-    print("-" * 80)
-
-    start_time = time.time()
-
-    # ====================== 1. Create scheduler ======================
-    scheduler = OptimalSchedule(
-        model_name=args.model,
-        r1=args.r1,
-        max_iter=3000,
-        lr=1e-2,
-        lr_decay=0.999,
-        tol=1e-6,
-        fd_eps=5e-6,
-        verbose=args.verbose,
-    )
-
-    print(f"Loaded stats for '{args.model}'")
-    print(f"λ range        : [{scheduler.lambda_min:.4f}, {scheduler.lambda_max:.4f}]")
-    print(f"ρ_∞            : {scheduler.rho_infty:.5f}")
-    print(f"ℓ_corr         : {scheduler.ell_corr:.5f}")
-
-    # ====================== 2. Optimize schedule ======================
-    print("\n[1/3] Optimizing Born schedule...")
-    scheduler.set_timesteps(num_inference_steps=args.steps)
-
-    opt_time = time.time() - start_time
-    print(f"Optimization finished in {opt_time:.2f}s")
-
-    # ====================== 3. Diagnostics ======================
-    print("\n[2/3] Diagnostics:")
-    lambdas = scheduler.get_lambdas()
-    cost    = scheduler.cost_at_schedule()
-
-    print(f"Final cost functional C = {cost:.6e}")
-    print(f"λ nodes ({args.steps+1} points):")
-    for i, lam in enumerate(lambdas):
-        print(f"  {i:2d}: λ = {lam:8.5f}   σ = {scheduler.lambda_to_sigma(lam):8.5f}")
-
-    # Equidistribution check (should be roughly flat at optimum)
-    residuals = scheduler.equidistribution_residuals()
-    if residuals is not None:
-        mean_res = float(np.mean(residuals))
-        std_res  = float(np.std(residuals))
-        print(f"\nEquidistribution residuals (V_res + D)·Γ²:")
-        print(f"  Mean = {mean_res:.4e}   Std = {std_res:.4e}   CV = {std_res/mean_res*100:.2f}%")
-
-        # Check uniformity quality
-        if std_res / mean_res < 0.25:
-            print("  → Excellent uniformity (CV < 25%)")
-        elif std_res / mean_res < 0.40:
-            print("  → Good uniformity")
-        else:
-            print("  → Moderate uniformity — consider more iterations or smaller fd_eps")
-
-    # ====================== 4. Optional Plot ======================
-    if args.plot:
-        try:
-            import matplotlib.pyplot as plt
-            print("\n[3/3] Generating plots...")
-
-            fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-
-            # 1. Lambda schedule
-            axs[0,0].plot(lambdas, 'o-', label='Optimized λ')
-            axs[0,0].set_title('Optimized λ Schedule')
-            axs[0,0].set_xlabel('Step index')
-            axs[0,0].set_ylabel('λ (log-SNR)')
-            axs[0,0].grid(True, alpha=0.3)
-
-            # 2. Sigma schedule
-            sigmas = scheduler.lambda_to_sigma(lambdas)
-            axs[0,1].plot(sigmas, 'o-', color='orange', label='σ(t)')
-            axs[0,1].set_title('Sigma Schedule')
-            axs[0,1].set_xlabel('Step index')
-            axs[0,1].set_ylabel('σ')
-            axs[0,1].grid(True, alpha=0.3)
-
-            # 3. Equidistribution residuals
-            axs[1,0].plot(residuals, 'o-', color='green')
-            axs[1,0].axhline(mean_res, color='red', linestyle='--', alpha=0.7, label=f'Mean = {mean_res:.2e}')
-            axs[1,0].set_title('Equidistribution Residuals (should be flat)')
-            axs[1,0].set_xlabel('Step index')
-            axs[1,0].set_ylabel('(V^res_j + D_j) Γ_j²')
-            axs[1,0].legend()
-            axs[1,0].grid(True, alpha=0.3)
-
-            # 4. Cumulative contribution
-            cum_contrib = np.cumsum(residuals[::-1])[::-1] / np.sum(residuals)
-            axs[1,1].plot(cum_contrib, 'o-', color='purple')
-            axs[1,1].set_title('Cumulative Error Contribution')
-            axs[1,1].set_xlabel('Step index (from noisy → clean)')
-            axs[1,1].set_ylabel('Cumulative fraction')
-            axs[1,1].grid(True, alpha=0.3)
-
-            plt.tight_layout()
-            plt.show()
-
-        except ImportError:
-            print("Matplotlib not available, skipping plots.")
-
-    total_time = time.time() - start_time
-    print("\n" + "="*80)
-    print(f"Verification completed successfully in {total_time:.2f}s")
-    print(f"OptimalSchedule ready for use with {args.steps} steps.")
-    print("="*80)
