@@ -6,12 +6,15 @@ __pycache__/
 # outputs
 fid_out/
 samples/
+sweep_out/
 
 # editor
 .vscode/
 
 # python
 *.pyc
+*.csv
+*.ipynb
 
 
 .env

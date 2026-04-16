@@ -1,12 +1,5 @@
 """
-flux_benchmark_resume.py  (fixed)
-==================================
-Changes vs original:
-  1. make_locked_scheduler: monkey-patches set_timesteps so pipeline can never
-     overwrite our custom sigmas.
-  2. phase_generate: skips uniform_nfe* tags (images already generated).
-  3. VQAScorer._p_yes: fixed BLIP logits indexing bug (was 2-D, crashed).
-     Now uses .generate() → decode → "yes"/"no" match for reliability.
+Usage
 
 nohup python flux_benchmark_resume.py \
       --schedules_dir /media/ssd_horse/keying/eval_results \
@@ -197,7 +190,7 @@ def make_locked_scheduler(base_scheduler, custom_sigmas_np: np.ndarray):
         self.timesteps           = timesteps_t.to(dev)
         self.num_inference_steps = n
         self._step_index         = None
-        self.begin_index         = None
+        self._begin_index = None
 
     sched.set_timesteps = types.MethodType(_locked_set_timesteps, sched)
     return sched

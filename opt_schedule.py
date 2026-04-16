@@ -447,7 +447,7 @@ class OptimalSchedule:
         w_rank1: float = 1.0,
         w_vres:  float = 1.0,
         w_disc:  float = 1.0,
-        alpha_power: float = 0.5,   # γ: α^{2γ} weighting. 1.0=original, 0.5=default, 0.0=uniform
+        alpha_power: float = 1.0,   # γ: α^{2γ} weighting. 1.0=original, 0.5=default, 0.0=uniform
         ckpt_dir: Optional[str] = None,
         ckpt_every: int = 500,
         verbose: bool = False,
