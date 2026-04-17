@@ -311,6 +311,20 @@ def run_one(
 # ─────────────────────────────────────────────────────────────────────────────
 # CSV
 # ─────────────────────────────────────────────────────────────────────────────
+def load_completed_runs(run_csv: Path) -> set:
+    """comleted (nfe, lr, max_iter, seed) """
+    if not run_csv.exists():
+        return set()
+    completed = set()
+    with open(run_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                key = (int(row["nfe"]), float(row["lr"]),
+                       int(row["max_iter"]), int(row["seed"]))
+                completed.add(key)
+            except (KeyError, ValueError):
+                pass
+    return completed
 
 def append_csv(path: Path, obj, cols):
     d = asdict(obj)
@@ -405,9 +419,19 @@ def main():
     print("Loading model…")
     unet, ns, dpm_solver = load_model(device)
     print("Ready.\n")
+    # ── 在 work_dir / load_model 之后加 ──
+    completed = load_completed_runs(Path(args.run_csv))
+    if completed:
+        print(f"Resuming: {len(completed)} runs already done, skipping.\n")
 
     all_summaries = []
     for i, (nfe, lr, max_iter, seed) in enumerate(configs, 1):
+        key = (nfe, lr, max_iter, seed)
+        if key in completed:
+            print(f"[{i}/{len(configs)}]  SKIP (done)  "
+                  f"NFE={nfe} lr={lr:.0e} max_iter={max_iter} seed={seed}")
+            continue                          # skip
+
         print(f"\n{'─'*60}")
         print(f"[{i}/{len(configs)}]  NFE={nfe}  lr={lr:.0e}  "
               f"max_iter={max_iter}  seed={seed}")

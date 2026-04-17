@@ -1,20 +1,12 @@
 """
 flux_schedule.py  —  BornSchedule optimal timestep scheduler for FLUX FM models.
 
-Cost functional (FM Euler, empirically validated):
+Cost functional:
 
   C = w_rank1 · ρ_∞ · (Σ_j γ_j · a_j)²      [rank-1, score-error bias]
     + w_vres  ·        Σ_j γ_j² · V_j^res    [residual score variance]
     + w_disc  ·        Σ_j γ_j² · D_j        [discretisation variance]
 
-Definitions (FM / Euler):
-  h_j   = σ_{j−1} − σ_j  > 0            (step size; σ decreasing)
-  ε_k   = h_k · g(σ_{k−1}) · (−1)       (propagator correction; g≈0 for FM)
-  γ_j   = ∏_{k=j+1}^{N} (1 + ε_k)       (scalar propagator ≈ 1)
-  a_j   = ∫_{σ_j}^{σ_{j-1}} σ_η(τ) dτ   (rank-1 score-error weight)
-  V_j^res = σ²_η(σ̄_j) · φ^res(h_j,h_j)  (residual score variance)
-  D_j   = (h_j⁴/4) · σ²_{v̇}(σ_{j-1})   (discretisation variance)
-  φ^res(a,b) = φ(a,b) − ρ_∞ · a · b      (residual kernel double-integral)
 """
 
 import os, math, warnings
@@ -269,34 +261,6 @@ def _project_ordering(
         x[i] = float(np.clip(x[i], lo, hi))
     return x
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Importance scores  (segment-tree / Pareto sparsification)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def compute_importance_scores(
-    sigmas: np.ndarray,
-    g_fn, sigma2_fn, sigma2_vdot_fn, phi_res_fn,
-    w_vres: float = 1.0,
-    w_disc: float = 1.0,
-) -> np.ndarray:
-    """
-    I_k = γ_k² · (w_vres · V_k^res + w_disc · D_k)
-
-    Greedy sparsification: remove step with smallest I_k to reduce NFE by 1.
-    Because FM error is additive and γ≈1, I_k is approximately separable
-    → O(N) greedy scan is near-optimal.
-    """
-    N   = len(sigmas) - 1
-    eps = np.array([_compute_epsilon_fm(sigmas[k-1], sigmas[k], g_fn)
-                    for k in range(1, N+1)])
-    Gamma = _compute_gamma(eps)
-    # Need phi_res for V_arr — caller must provide it
-    V_arr = np.array([_compute_V_res_fm(sigmas[k-1], sigmas[k], sigma2_fn, phi_res_fn)
-                      for k in range(1, N+1)])
-    D_arr = np.array([_compute_D_j(sigmas[k-1], sigmas[k], sigma2_vdot_fn)
-                      for k in range(1, N+1)])
-    return Gamma**2 * (w_vres * V_arr + w_disc * D_arr)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -562,48 +526,6 @@ def diagnose_schedule(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Pareto curve
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_pareto_schedules(
-    sigmas_full: np.ndarray,
-    nfe_min: int,
-    npz_path: str,
-    w_vres: float = 1.0,
-    w_disc: float = 0.5,
-) -> dict:
-    """
-    Greedy NFE reduction: at each step remove the interior σ-point with
-    the smallest importance score I_k = γ_k²(w_vres V_k + w_disc D_k).
-    Returns {nfe: sigmas_array} for nfe = N_full, N_full-1, …, nfe_min.
-    """
-    sigma2_fn, sigma2_vdot_fn, g_fn, phi_res, rho_infty = _load_stats(npz_path)
-
-    schedules = {len(sigmas_full)-1: sigmas_full.copy()}
-    current   = sigmas_full.copy()
-
-    while len(current) - 1 > nfe_min:
-        N   = len(current) - 1
-        eps = np.array([_compute_epsilon_fm(current[k-1], current[k], g_fn)
-                        for k in range(1, N+1)])
-        Gam = _compute_gamma(eps)
-        V_  = np.array([_compute_V_res_fm(current[k-1], current[k], sigma2_fn, phi_res)
-                        for k in range(1, N+1)])
-        D_  = np.array([_compute_D_j(current[k-1], current[k], sigma2_vdot_fn)
-                        for k in range(1, N+1)])
-        I_  = Gam**2 * (w_vres * V_ + w_disc * D_)
-
-        # Among interior steps (exclude j=0 and j=N-1 near boundaries), remove min I
-        remove_idx = int(np.argmin(I_[1:-1])) + 1
-        current    = np.delete(current, remove_idx)
-        schedules[len(current)-1] = current.copy()
-        print(f"  NFE {N} → {N-1}: removed step {remove_idx}  "
-              f"I={I_[remove_idx]:.3e}")
-
-    return schedules
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Diffusers injection
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -628,71 +550,3 @@ def sigmas_to_flux_scheduler(
     sched.sigmas    = ts
     return sched
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI
-# ══════════════════════════════════════════════════════════════════════════════
-
-def parse_args():
-    import argparse
-    p = argparse.ArgumentParser(
-        description="BornSchedule optimal σ-schedule for FLUX FM models.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("--stats",      required=True,  help=".npz from stats_flux.py")
-    p.add_argument("--nfe",        type=int,   default=28)
-    p.add_argument("--sigma_max",  type=float, default=0.97)
-    p.add_argument("--sigma_min",  type=float, default=0.02)
-    p.add_argument("--n_steps",    type=int,   default=2000)
-    p.add_argument("--lr",         type=float, default=1e-3)
-    p.add_argument("--lr_decay",   type=float, default=0.995)
-    p.add_argument("--n_restarts", type=int,   default=3)
-    p.add_argument("--barrier",    type=float, default=0.0)
-    p.add_argument("--w_rank1",    type=float, default=1.0)
-    p.add_argument("--w_vres",     type=float, default=1.0)
-    p.add_argument("--w_disc",     type=float, default=0.5)
-    p.add_argument("--pareto",     action="store_true")
-    p.add_argument("--pareto_min", type=int,   default=4)
-    p.add_argument("--output_dir", default="schedules")
-    p.add_argument("--n_quad",     type=int,   default=32)
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    out  = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
-    print(f"[flux_schedule] NFE={args.nfe}  stats={args.stats}")
-
-    sigmas = optimize_schedule(
-        npz_path=args.stats, nfe=args.nfe,
-        sigma_max=args.sigma_max, sigma_min=args.sigma_min,
-        n_steps=args.n_steps, lr=args.lr, lr_decay=args.lr_decay,
-        barrier_weight=args.barrier, n_quad=args.n_quad,
-        w_rank1=args.w_rank1, w_vres=args.w_vres, w_disc=args.w_disc,
-        n_restarts=args.n_restarts,
-    )
-
-    stem = Path(args.stats).stem
-    npy  = out / f"{stem}_nfe{args.nfe}.npy"
-    np.save(str(npy), sigmas)
-    print(f"\n[flux_schedule] → {npy}")
-    print(f"  σ = {np.round(sigmas, 4).tolist()}")
-
-    diagnose_schedule(sigmas, args.stats,
-                      label=f"BornSchedule NFE={args.nfe}",
-                      out_path=str(out / f"{stem}_nfe{args.nfe}_diag.png"))
-
-    if args.pareto:
-        print(f"\n[flux_schedule] Pareto NFE {args.nfe}→{args.pareto_min} …")
-        schedules = build_pareto_schedules(
-            sigmas, args.pareto_min, args.stats,
-            w_vres=args.w_vres, w_disc=args.w_disc)
-        for nfe_k, sg in schedules.items():
-            np.save(str(out / f"{stem}_nfe{nfe_k}.npy"), sg)
-        print(f"  saved NFE ∈ {sorted(schedules.keys())}")
-
-    print("[flux_schedule] done.")
-
-
-if __name__ == "__main__":
-    main()

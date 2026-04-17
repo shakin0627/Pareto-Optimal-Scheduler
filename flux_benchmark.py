@@ -1,11 +1,4 @@
-#!/usr/bin/env python3
 """
------------
-  # one-time setup
-  pip install diffusers transformers accelerate pyiqa open-clip-torch \
-              pillow tqdm numpy torch torchvision
-
-  # run (background, immune to SSH drop)
   nohup python flux_benchmark.py \
         --stats flux_stats.npz \
         --model "black-forest-labs/FLUX.1-dev" \
