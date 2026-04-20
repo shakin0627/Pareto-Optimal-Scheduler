@@ -153,6 +153,13 @@ def _compute_gamma(eps: np.ndarray, lambdas:np.ndarray) -> np.ndarray:
         Gamma[k] = Gamma[k + 1] * (1.0 + eps[k + 1])
     return Gamma
 
+# def _compute_gamma(eps: np.ndarray, lambdas: np.ndarray) -> np.ndarray:
+#     N     = len(eps)
+#     Gamma = np.ones(N)
+#     EPS_CLIP = 1e-2   
+#     for k in range(N - 2, -1, -1):
+#         Gamma[k] = Gamma[k + 1] * max(1.0 + eps[k + 1], EPS_CLIP)
+#     return Gamma
 
 # ─────────────────────────────────────────────────────────────────────────────
 # A_j  —  rank-1 weight  (1-D quadrature)
@@ -371,19 +378,19 @@ def _numerical_gradient(
     return grad
 
 
-def _project_ordering(
-    interior: np.ndarray,
-    lam0: float,
-    lamN: float,
-    min_gap: float,
-) -> np.ndarray:
-    x = np.sort(interior.copy())
-    n = len(x)
-    for i in range(n):
-        x[i] = float(np.clip(x[i],
-                              lam0 + (i + 1) * min_gap,
-                              lamN - (n - i) * min_gap))
-    return x
+# def _project_ordering(
+#     interior: np.ndarray,
+#     lam0: float,
+#     lamN: float,
+#     min_gap: float,
+# ) -> np.ndarray:
+#     x = np.sort(interior.copy())
+#     n = len(x)
+#     for i in range(n):
+#         x[i] = float(np.clip(x[i],
+#                               lam0 + (i + 1) * min_gap,
+#                               lamN - (n - i) * min_gap))
+#     return x
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -454,6 +461,20 @@ def _extract_rho_infty_and_ell(
     ell_corr = float(rho_s[cross[0]]) if len(cross) > 0 else float(rho_s[-1])
 
     return rho_infty, ell_corr
+
+def _alpha_to_lambdas(alpha: np.ndarray,
+                      lam0: float,
+                      lamN: float) -> np.ndarray:
+    """
+    alpha ∈ R^N (unconstrained)
+    h_i = softmax(alpha)_i · (lamN - lam0)   
+    lambdas = [lam0, lam0+h_1, lam0+h_1+h_2, ..., lamN]  
+    """
+    span = lamN - lam0
+    a    = alpha - alpha.max()          
+    h    = np.exp(a) / np.exp(a).sum() * span
+    interior = lam0 + np.cumsum(h)[:-1]
+    return np.concatenate([[lam0], interior, [lamN]])
 
 _STATS_SEARCH_PATHS = [
     Path(os.environ.get("OPT_SCHEDULE_STATS_DIR", ".")),
@@ -528,7 +549,7 @@ class OptimalSchedule:
         w_disc:  float = 1.0,        
         ckpt_dir: Optional[str] = None,  
         ckpt_every: int = 500,            
-        verbose: bool = False,
+        verbose: bool = True,
         stats_override: Optional[dict] = None,
     ):
         self.model_name           = model_name
@@ -703,138 +724,354 @@ class OptimalSchedule:
     def _optimise(self, N: int) -> np.ndarray:
         lam0      = self.lambda_min
         lamN      = self.lambda_max
-        h_uniform = (lamN - lam0) / N
-        min_gap   = h_uniform / 5.0
-
-        interior = np.linspace(lam0, lamN, N + 1)[1:-1].copy()
-        grad = self._grad(interior, self.lambda_min, self.lambda_max, barrier_weight=0.0)
-        print(f"gradient at uniform_logSNR: {grad}")
-        print(f"gradient norm: {np.linalg.norm(grad):.6f}")
-
-        # Auto-scale barrier: C(uniform) / N  × scale
-        # At uniform schedule the log-barrier term = 0, so this only affects
-        # the curvature near degenerate boundaries, not the interior optimum.
-        cost_uniform = self._cost(np.linspace(lam0, lamN, N + 1), barrier_weight=0.0)
-        barrier_weight = self.barrier_weight_scale * cost_uniform / N
+        # ── 一次性诊断：打印均匀schedule下的中间量 ──────────────────────────
+        lams_uniform = np.linspace(lam0, lamN, N + 1)
+        print("\n=== DIAGNOSTIC: uniform schedule ===")
+        for k in range(1, N + 1):
+            lp = lams_uniform[k-1]
+            lc = lams_uniform[k]
+            h      = lc - lp
+            lam_s  = lp + self.r1 * h
+            I_full = math.exp(-lp) - math.exp(-lc)
+            I_half = math.exp(-lp) - math.exp(-lam_s)
+            al_p   = _alpha(lp)
+            al_s   = _alpha(lam_s)
+            a_k    = (1.0 - 1.0/(2.0*self.r1)) * al_p * I_full
+            b_k    = -(al_s/(2.0*self.r1)) * I_full
+            phi_k  = 1.0 + al_p * I_half * self.g_fn(lp)
+            g_lp   = self.g_fn(lp)
+            g_ls   = self.g_fn(lam_s)
+            eps    = a_k * g_lp + b_k * g_ls * phi_k
+            print(f"  step{k}: lp={lp:.3f} lc={lc:.3f} h={h:.3f} "
+                f"I_full={I_full:.4f} a_k={a_k:.4f} b_k={b_k:.4f} "
+                f"g(lp)={g_lp:.4f} g(ls)={g_ls:.4f} phi_k={phi_k:.4f} "
+                f"eps={eps:.4f}")
+        print("=====================================\n")
+        # ────────────────────────────────────────────────────────────────────
+        cost_uniform   = self._cost(np.linspace(lam0, lamN, N + 1), barrier_weight=0.0)
+        # barrier_weight = self.barrier_weight_scale * cost_uniform / N
+        barrier_weight = self.barrier_weight_scale * (lamN - lam0) / N
         if self.verbose:
             print(f"  [BornSchedule] N={N}  C(uniform)={cost_uniform:.4e}  "
-                  f"barrier_weight={barrier_weight:.3e}")
+                f"barrier_weight={barrier_weight:.3e}")
+        # h_uniform = (lamN - lam0) / N
+        # min_gap   = h_uniform / 5.0
 
-        m, v     = np.zeros_like(interior), np.zeros_like(interior)
-        lr       = self.lr
-        best_cost     = np.inf
-        best_interior = interior.copy()
+        # interior = np.linspace(lam0, lamN, N + 1)[1:-1].copy()
+        # grad = self._grad(interior, self.lambda_min, self.lambda_max, barrier_weight=0.0)
+        # print(f"gradient at uniform_logSNR: {grad}")
+        # print(f"gradient norm: {np.linalg.norm(grad):.6f}")
+
+        # # Auto-scale barrier: C(uniform) / N  × scale
+        # # At uniform schedule the log-barrier term = 0, so this only affects
+        # # the curvature near degenerate boundaries, not the interior optimum.
+        # cost_uniform = self._cost(np.linspace(lam0, lamN, N + 1), barrier_weight=0.0)
+        # barrier_weight = self.barrier_weight_scale * cost_uniform / N
+        # if self.verbose:
+        #     print(f"  [BornSchedule] N={N}  C(uniform)={cost_uniform:.4e}  "
+        #           f"barrier_weight={barrier_weight:.3e}")
+
+        # m, v     = np.zeros_like(interior), np.zeros_like(interior)
+        # lr       = self.lr
+        # best_cost     = np.inf
+        # best_interior = interior.copy()
+
+        # for it in range(1, self.max_iter + 1):
+        #     grad     = self._grad(interior, lam0, lamN, barrier_weight)
+        #     m        = self.beta1 * m + (1.0 - self.beta1) * grad
+        #     v        = self.beta2 * v + (1.0 - self.beta2) * grad ** 2
+        #     mh       = m / (1.0 - self.beta1 ** it)
+        #     vh       = v / (1.0 - self.beta2 ** it)
+        #     interior = interior - lr * mh / (np.sqrt(vh) + 1e-8)
+        #     interior = _project_ordering(interior, lam0, lamN, min_gap)
+
+        #     cost = self._cost(np.concatenate([[lam0], interior, [lamN]]), barrier_weight)
+        #     if cost < best_cost:
+        #         best_cost, best_interior = cost, interior.copy()
+
+        #     if self.ckpt_dir and (it % self.ckpt_every == 0):
+        #         self._save_ckpt(it, interior, lam0, lamN, cost)
+                
+        #     gnorm = float(np.linalg.norm(grad))
+        #     if self.verbose and (it % max(1, self.max_iter // 10) == 0 or it == 1):
+        #         print(f"  iter {it:4d}  cost={cost:.4e}  |g|={gnorm:.3e}  lr={lr:.4e}")
+        #     if gnorm < self.tol:
+        #         if self.verbose:
+        #             print(f"  converged  iter={it}  |g|={gnorm:.3e}")
+        #         break
+        #     lr *= self.lr_decay
+
+        # lams_best = np.concatenate([[lam0], best_interior, [lamN]])
+
+        # if self.verbose:
+        #     self._print_cost_breakdown(lams_best)
+
+        # self._lambdas_opt = lams_best
+
+        # return lams_best
+        # softmax 参数：alpha=0 → 均匀步长
+        alpha = np.zeros(N)
+        m     = np.zeros_like(alpha)
+        v     = np.zeros_like(alpha)
+        lr    = self.lr
+        best_cost  = np.inf
+        best_alpha = alpha.copy()
 
         for it in range(1, self.max_iter + 1):
-            grad     = self._grad(interior, lam0, lamN, barrier_weight)
-            m        = self.beta1 * m + (1.0 - self.beta1) * grad
-            v        = self.beta2 * v + (1.0 - self.beta2) * grad ** 2
-            mh       = m / (1.0 - self.beta1 ** it)
-            vh       = v / (1.0 - self.beta2 ** it)
-            interior = interior - lr * mh / (np.sqrt(vh) + 1e-8)
-            interior = _project_ordering(interior, lam0, lamN, min_gap)
+            # FD gradient 在 alpha 空间
+            grad = np.zeros_like(alpha)
+            fd_h = self.fd_eps          # alpha空间扰动，1e-3量级
+            kw = dict(
+                g_fn=self.g_fn, sigma2_fn=self.sigma2_fn,
+                sigma2_gpp_fn=self.sigma2_gpp_fn, phi_res_fn=self._phi_res_fn,
+                ell_gpp=self.ell_gpp, rho_infty=self.rho_infty, r1=self.r1,
+                barrier_weight=barrier_weight,
+                w_rank1=self.w_rank1, w_vres=self.w_vres, w_disc=self.w_disc,
+            )
+            for i in range(N):
+                ap = alpha.copy(); ap[i] += fd_h
+                am = alpha.copy(); am[i] -= fd_h
+                Cp = _cost_functional(_alpha_to_lambdas(ap, lam0, lamN), **kw)
+                Cm = _cost_functional(_alpha_to_lambdas(am, lam0, lamN), **kw)
+                grad[i] = (Cp - Cm) / (2.0 * fd_h)
 
-            cost = self._cost(np.concatenate([[lam0], interior, [lamN]]), barrier_weight)
+            m  = self.beta1 * m + (1.0 - self.beta1) * grad
+            v  = self.beta2 * v + (1.0 - self.beta2) * grad ** 2
+            mh = m / (1.0 - self.beta1 ** it)
+            vh = v / (1.0 - self.beta2 ** it)
+            alpha = alpha - lr * mh / (np.sqrt(vh) + 1e-8)
+            lr   *= self.lr_decay
+
+            lambdas = _alpha_to_lambdas(alpha, lam0, lamN)
+            cost    = _cost_functional(lambdas, **kw)
             if cost < best_cost:
-                best_cost, best_interior = cost, interior.copy()
+                best_cost  = cost
+                best_alpha = alpha.copy()
 
-            if self.ckpt_dir and (it % self.ckpt_every == 0):
-                self._save_ckpt(it, interior, lam0, lamN, cost)
-                
             gnorm = float(np.linalg.norm(grad))
             if self.verbose and (it % max(1, self.max_iter // 10) == 0 or it == 1):
-                print(f"  iter {it:4d}  cost={cost:.4e}  |g|={gnorm:.3e}  lr={lr:.4e}")
+                h = np.diff(lambdas)
+                print(f"  iter {it:4d}  cost={cost:.4e}  |g|={gnorm:.3e}  "
+                    f"h_cv={h.std()/h.mean():.3f}  lr={lr:.4e}")
+
             if gnorm < self.tol:
                 if self.verbose:
                     print(f"  converged  iter={it}  |g|={gnorm:.3e}")
                 break
-            lr *= self.lr_decay
-
-        lams_best = np.concatenate([[lam0], best_interior, [lamN]])
-
+            # # 诊断：打印每步的 eps, Gamma, V_j, D_j
+            # lams = lambdas
+            # N = len(lams) - 1
+            # eps_arr = np.array([_compute_epsilon(lams[k-1], lams[k], self.g_fn, self.r1)
+            #                     for k in range(1, N+1)])
+            # Gamma = _compute_gamma(eps_arr, lams)
+            # Vres  = np.array([_compute_V_res(lams[k-1], lams[k], self.g_fn, self.sigma2_fn,
+            #                                 self._phi_res_fn, self.r1)
+            #                 for k in range(1, N+1)])
+            # D     = np.array([_compute_D_j(lams[k-1], lams[k], self.g_fn, self.sigma2_gpp_fn,
+            #                                 self.ell_gpp, self.r1)
+            #                 for k in range(1, N+1)])
+            # print("eps:  ", np.round(eps_arr, 4))
+            # print("Gamma:", np.round(Gamma,   4))
+            # print("V_j:  ", np.round(Vres,    6))
+            # print("D_j:  ", np.round(D,       8))
+            # print("sigma2_eta at each lam_bar:",
+            #     [round(self.sigma2_fn(0.5*(lams[k]+lams[k+1])), 6) for k in range(N)])
+        lams_best = _alpha_to_lambdas(best_alpha, lam0, lamN)
         if self.verbose:
             self._print_cost_breakdown(lams_best)
-
         self._lambdas_opt = lams_best
-
         return lams_best
     
     def _optimise_with_hooks(
         self,
         N: int,
-        capture_steps: int = 10,   
+        capture_steps: int = 10,
     ) -> np.ndarray:
-        """
-        same as _optimise
-        """
-        lam0      = self.lambda_min
-        lamN      = self.lambda_max
-        h_uniform = (lamN - lam0) / N
-        min_gap   = h_uniform / 5.0
- 
-        interior = np.linspace(lam0, lamN, N + 1)[1:-1].copy()
- 
-        cost_uniform   = self._cost(np.linspace(lam0, lamN, N + 1), barrier_weight=0.0)
-        barrier_weight = self.barrier_weight_scale * cost_uniform / N
- 
-        if self.verbose:
-            print(f"  [BornSchedule] N={N}  C(uniform)={cost_uniform:.4e}  "
-                  f"barrier_weight={barrier_weight:.3e}")
- 
-        m, v  = np.zeros_like(interior), np.zeros_like(interior)
+
+        lam0 = self.lambda_min
+        lamN = self.lambda_max
+
+        # ---------- alpha parameterization ----------
+        alpha = np.zeros(N)
+        m     = np.zeros_like(alpha)
+        v     = np.zeros_like(alpha)
         lr    = self.lr
- 
-        best_cost     = np.inf
-        best_interior = interior.copy()
- 
+
+        # ---------- init ----------
+        cost_uniform   = self._cost(np.linspace(lam0, lamN, N + 1), barrier_weight=0.0)
+        # barrier_weight = self.barrier_weight_scale * cost_uniform / N
+        barrier_weight = self.barrier_weight_scale * (lamN - lam0) / N
+
+        if self.verbose:
+            print(f"  [BornSchedule-α] N={N}  C(uniform)={cost_uniform:.4e}  "
+                f"barrier_weight={barrier_weight:.3e}")
+
+        best_cost  = np.inf
+        best_alpha = alpha.copy()
+
         grad_history: list[float] = []
- 
+
+        # ---------- kwargs ----------
+        kw = dict(
+            g_fn=self.g_fn,
+            sigma2_fn=self.sigma2_fn,
+            sigma2_gpp_fn=self.sigma2_gpp_fn,
+            phi_res_fn=self._phi_res_fn,
+            ell_gpp=self.ell_gpp,
+            rho_infty=self.rho_infty,
+            r1=self.r1,
+            barrier_weight=barrier_weight,
+            w_rank1=self.w_rank1,
+            w_vres=self.w_vres,
+            w_disc=self.w_disc,
+        )
+
         for it in range(1, self.max_iter + 1):
-            grad = self._grad(interior, lam0, lamN, barrier_weight)
+
+            # ---------- FD gradient (alpha space) ----------
+            grad = np.zeros_like(alpha)
+            fd_h = self.fd_eps
+
+            for i in range(N):
+                ap = alpha.copy(); ap[i] += fd_h
+                am = alpha.copy(); am[i] -= fd_h
+
+                Cp = _cost_functional(_alpha_to_lambdas(ap, lam0, lamN), **kw)
+                Cm = _cost_functional(_alpha_to_lambdas(am, lam0, lamN), **kw)
+
+                grad[i] = (Cp - Cm) / (2.0 * fd_h)
+
             gnorm = float(np.linalg.norm(grad))
             grad_history.append(gnorm)
- 
+
+            # ---------- Adam ----------
             m  = self.beta1 * m + (1.0 - self.beta1) * grad
             v  = self.beta2 * v + (1.0 - self.beta2) * grad ** 2
             mh = m / (1.0 - self.beta1 ** it)
             vh = v / (1.0 - self.beta2 ** it)
-            interior = interior - lr * mh / (np.sqrt(vh) + 1e-8)
-            interior = _project_ordering(interior, lam0, lamN, min_gap)
- 
-            cost = self._cost(np.concatenate([[lam0], interior, [lamN]]),
-                              barrier_weight)
+
+            alpha = alpha - lr * mh / (np.sqrt(vh) + 1e-8)
+
+            # ---------- evaluate ----------
+            lambdas = _alpha_to_lambdas(alpha, lam0, lamN)
+            cost    = _cost_functional(lambdas, **kw)
+
             if cost < best_cost:
-                best_cost, best_interior = cost, interior.copy()
- 
-            # checkpoint
+                best_cost  = cost
+                best_alpha = alpha.copy()
+
+            # ---------- checkpoint ----------
             if self.ckpt_dir and (it % self.ckpt_every == 0):
-                self._save_ckpt(it, interior, lam0, lamN, cost)
- 
+                self._save_ckpt(it, lambdas[1:-1], lam0, lamN, cost)
+
+            # ---------- logging ----------
             if self.verbose and (it % max(1, self.max_iter // 10) == 0 or it == 1):
-                print(f"  iter {it:4d}  cost={cost:.4e}  |g|={gnorm:.3e}  lr={lr:.4e}")
- 
+                h = np.diff(lambdas)
+                print(f"  iter {it:4d}  cost={cost:.4e}  |g|={gnorm:.3e}  "
+                    f"h_cv={h.std()/h.mean():.3f}  lr={lr:.4e}")
+
+            # ---------- stop ----------
             if gnorm < self.tol:
                 if self.verbose:
                     print(f"  converged  iter={it}  |g|={gnorm:.3e}")
                 break
- 
+
             lr *= self.lr_decay
- 
-        lams_best = np.concatenate([[lam0], best_interior, [lamN]])
- 
+
+        # ---------- final ----------
+        lams_best = _alpha_to_lambdas(best_alpha, lam0, lamN)
+
         if self.ckpt_dir:
-            self._save_ckpt(-1, best_interior, lam0, lamN, best_cost)
- 
+            self._save_ckpt(-1, lams_best[1:-1], lam0, lamN, best_cost)
+
         if self.verbose:
             self._print_cost_breakdown(lams_best)
- 
+
+        # ---------- stats ----------
         self.grad_history    = grad_history
         self.final_grad_norm = grad_history[-1] if grad_history else float("nan")
         self.n_iter_actual   = len(grad_history)
         self.converged       = (grad_history[-1] < self.tol) if grad_history else False
         self._lambdas_opt    = lams_best
- 
+
         return lams_best
+    
+    # def _optimise_with_hooks(
+    #     self,
+    #     N: int,
+    #     capture_steps: int = 10,   
+    # ) -> np.ndarray:
+    #     """
+    #     same as _optimise
+    #     """
+    #     lam0      = self.lambda_min
+    #     lamN      = self.lambda_max
+    #     h_uniform = (lamN - lam0) / N
+    #     min_gap   = h_uniform / 5.0
+ 
+    #     interior = np.linspace(lam0, lamN, N + 1)[1:-1].copy()
+ 
+    #     cost_uniform   = self._cost(np.linspace(lam0, lamN, N + 1), barrier_weight=0.0)
+    #     barrier_weight = self.barrier_weight_scale * cost_uniform / N
+ 
+    #     if self.verbose:
+    #         print(f"  [BornSchedule] N={N}  C(uniform)={cost_uniform:.4e}  "
+    #               f"barrier_weight={barrier_weight:.3e}")
+ 
+    #     m, v  = np.zeros_like(interior), np.zeros_like(interior)
+    #     lr    = self.lr
+ 
+    #     best_cost     = np.inf
+    #     best_interior = interior.copy()
+ 
+    #     grad_history: list[float] = []
+ 
+    #     for it in range(1, self.max_iter + 1):
+    #         grad = self._grad(interior, lam0, lamN, barrier_weight)
+    #         gnorm = float(np.linalg.norm(grad))
+    #         grad_history.append(gnorm)
+ 
+    #         m  = self.beta1 * m + (1.0 - self.beta1) * grad
+    #         v  = self.beta2 * v + (1.0 - self.beta2) * grad ** 2
+    #         mh = m / (1.0 - self.beta1 ** it)
+    #         vh = v / (1.0 - self.beta2 ** it)
+    #         interior = interior - lr * mh / (np.sqrt(vh) + 1e-8)
+    #         interior = _project_ordering(interior, lam0, lamN, min_gap)
+ 
+    #         cost = self._cost(np.concatenate([[lam0], interior, [lamN]]),
+    #                           barrier_weight)
+    #         if cost < best_cost:
+    #             best_cost, best_interior = cost, interior.copy()
+ 
+    #         # checkpoint
+    #         if self.ckpt_dir and (it % self.ckpt_every == 0):
+    #             self._save_ckpt(it, interior, lam0, lamN, cost)
+ 
+    #         if self.verbose and (it % max(1, self.max_iter // 10) == 0 or it == 1):
+    #             print(f"  iter {it:4d}  cost={cost:.4e}  |g|={gnorm:.3e}  lr={lr:.4e}")
+ 
+    #         if gnorm < self.tol:
+    #             if self.verbose:
+    #                 print(f"  converged  iter={it}  |g|={gnorm:.3e}")
+    #             break
+ 
+    #         lr *= self.lr_decay
+ 
+    #     lams_best = np.concatenate([[lam0], best_interior, [lamN]])
+ 
+    #     if self.ckpt_dir:
+    #         self._save_ckpt(-1, best_interior, lam0, lamN, best_cost)
+ 
+    #     if self.verbose:
+    #         self._print_cost_breakdown(lams_best)
+ 
+    #     self.grad_history    = grad_history
+    #     self.final_grad_norm = grad_history[-1] if grad_history else float("nan")
+    #     self.n_iter_actual   = len(grad_history)
+    #     self.converged       = (grad_history[-1] < self.tol) if grad_history else False
+    #     self._lambdas_opt    = lams_best
+ 
+    #     return lams_best
     
     def _print_cost_breakdown(self, lams: np.ndarray) -> None:
         N     = len(lams) - 1

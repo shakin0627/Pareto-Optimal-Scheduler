@@ -14,6 +14,7 @@ Usage:
       --n_prompts 300
 """
 
+import io
 import os
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
@@ -36,6 +37,38 @@ from scipy.signal import savgol_filter
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# [F4] Actual Flux sigma range helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_flux_sigma_range(pipe, latent_size: int, nfe: int = 50) -> tuple[float, float]:
+    from diffusers.pipelines.flux.modular_pipeline_flux_utils import (
+        _get_initial_timesteps_and_optionals,
+    )
+    # latent_size=64 → 512px
+    pixel_size = latent_size * 8
+
+    _, _, sigmas, _ = _get_initial_timesteps_and_optionals(
+        transformer        = pipe.transformer,
+        scheduler          = pipe.scheduler,
+        batch_size         = 1,
+        height             = pixel_size,
+        width              = pixel_size,
+        vae_scale_factor   = pipe.vae_scale_factor,
+        num_inference_steps= nfe,
+        guidance_scale     = 3.5,
+        sigmas             = None,
+        device             = "cpu",
+    )
+
+    # sigmas    = pipe.scheduler.sigmas
+    sigma_max = float(sigmas.max().item())
+    sigma_min = float(sigmas[sigmas > 0].min().item())
+    print(f"  Flux actual σ ∈ [{sigma_min:.5f}, {sigma_max:.5f}]  "
+          f"(pixel={pixel_size}, nfe={nfe})")
+    return sigma_min, sigma_max
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # COCO / Flickr30k prompt loading + FLUX text encoding
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -50,9 +83,7 @@ def load_coco_captions(n: int = 300, seed: int = 0) -> list[str]:
     # ── try COCO 2017 ────────────────────────────────────────────────────────
     try:
         from datasets import load_dataset
-        ds = load_dataset("phiyodr/coco2017", split="validation",
-                          token=HF_TOKEN)
-        # column is "captions" (list of 5 strings per image)
+        ds = load_dataset("phiyodr/coco2017", split="validation", token=HF_TOKEN)
         capts = []
         for row in ds:
             for c in row["captions"]:
@@ -69,8 +100,7 @@ def load_coco_captions(n: int = 300, seed: int = 0) -> list[str]:
     # ── fallback: Flickr30k ──────────────────────────────────────────────────
     try:
         from datasets import load_dataset
-        ds   = load_dataset("nlphuji/flickr30k", split="test",
-                            token=HF_TOKEN)
+        ds   = load_dataset("nlphuji/flickr30k", split="test", token=HF_TOKEN)
         capts = []
         for row in ds:
             for c in row["caption"]:
@@ -98,14 +128,13 @@ def encode_prompts_flux(
     Returns:
         enc_all  (N, txt_seq, 4096)  – T5 hidden states
         pool_all (N, 768)            – CLIP pooled embedding
-    Both are on CPU (moved there immediately to save VRAM).
+    Both are on CPU.
     """
     enc_list  = []
     pool_list = []
 
     for start in range(0, len(prompts), batch_size):
         batch = prompts[start : start + batch_size]
-        # pipe.encode_prompt returns (prompt_embeds, pooled_prompt_embeds, ...)
         with torch.no_grad():
             out = pipe.encode_prompt(
                 prompt=batch,
@@ -114,8 +143,6 @@ def encode_prompts_flux(
                 num_images_per_prompt=1,
                 max_sequence_length=getattr(pipe, "tokenizer_max_length", 256),
             )
-        # diffusers FluxPipeline.encode_prompt returns (te, pe, ...) or a tuple
-        # depending on version; handle both
         if isinstance(out, (tuple, list)):
             te, pe = out[0], out[1]
         else:
@@ -135,30 +162,104 @@ def encode_prompts_flux(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# [F3] Real VAE latent encoding
+# ══════════════════════════════════════════════════════════════════════════════
+
+def encode_images_to_latents(
+    pipe,
+    n_samples: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    latent_size: int = 64,
+    seed: int = 0,
+) -> torch.Tensor:
+    """
+    Encode real COCO images through the Flux VAE to get x0 samples from
+    the true data distribution. Falls back to randn if COCO / VAE unavailable.
+
+    Returns (N, 16, latent_size, latent_size) on device.
+    """
+    from PIL import Image
+    import torchvision.transforms.functional as TF
+
+    pixel_size = latent_size * 8   # Flux VAE: 8× spatial downscale
+    print(f"  [F3] encoding {n_samples} real COCO images via VAE "
+          f"(pixel_size={pixel_size}) …")
+
+    try:
+        from datasets import load_dataset
+        ds = load_dataset(
+            "phiyodr/coco2017", split="validation",
+            token=HF_TOKEN, streaming=True,
+        )
+    except Exception as e:
+        print(f"  [F3] COCO unavailable ({e}) — falling back to randn latents")
+        return torch.randn(n_samples, 16, latent_size, latent_size,
+                           device=device, dtype=dtype)
+
+    pipe.vae = pipe.vae.to(device)
+    latents_list: list[torch.Tensor] = []
+
+    for i, row in enumerate(ds):
+        if len(latents_list) >= n_samples:
+            break
+        try:
+            img = row["image"]
+            # Streaming datasets sometimes wrap images as dicts
+            if isinstance(img, dict) and "bytes" in img:
+                img = Image.open(io.BytesIO(img["bytes"]))
+            elif not isinstance(img, Image.Image):
+                img = Image.open(io.BytesIO(img))
+            img = img.convert("RGB")
+            # Square centre-crop then resize
+            s   = min(img.size)
+            img = TF.center_crop(img, s)
+            img = img.resize((pixel_size, pixel_size), Image.LANCZOS)
+            x   = TF.to_tensor(img).unsqueeze(0).to(device=device, dtype=dtype)
+            x   = (x - 0.5) * 2.0   # [0,1] → [-1,1]
+
+            with torch.no_grad():
+                lat = pipe.vae.encode(x).latent_dist.sample()
+                # Flux VAE normalisation
+                lat = (lat - pipe.vae.config.shift_factor) \
+                      * pipe.vae.config.scaling_factor
+
+            latents_list.append(lat.squeeze(0).cpu())
+        except Exception:
+            continue
+
+        if (i + 1) % 50 == 0:
+            print(f"    VAE encoded {len(latents_list)}/{n_samples}")
+
+    if len(latents_list) < n_samples:
+        n_pad = n_samples - len(latents_list)
+        print(f"  [F3] only got {len(latents_list)} images, "
+              f"padding {n_pad} with randn")
+        for _ in range(n_pad):
+            latents_list.append(
+                torch.randn(16, latent_size, latent_size)
+            )
+
+    x0_all = torch.stack(latents_list[:n_samples]).to(device=device, dtype=dtype)
+    print(f"  [F3] x0 latents: {tuple(x0_all.shape)}  "
+          f"mean={x0_all.mean():.3f}  std={x0_all.std():.3f}")
+
+    # Offload VAE to free VRAM
+    pipe.vae.cpu()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return x0_all
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Model loading
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_flux(model_name: str, device: torch.device, dtype=torch.bfloat16):
-    from diffusers import FluxTransformer2DModel, FlowMatchEulerDiscreteScheduler
-    print(f"  [flux] loading transformer from {model_name} …")
-    tr = FluxTransformer2DModel.from_pretrained(
-        model_name, subfolder="transformer",
-        torch_dtype=dtype, token=HF_TOKEN,
-    ).to(device).eval()
-    for m in tr.modules():
-        if isinstance(m, torch.nn.Dropout):
-            m.p = 0.0
-    print(f"  [flux] loading scheduler …")
-    sched = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        model_name, subfolder="scheduler", token=HF_TOKEN,
-    )
-    return tr, sched
-
-
 def load_flux_pipeline(model_name: str, device: torch.device, dtype=torch.bfloat16):
-    """Load full FluxPipeline (needed for text encoding)."""
+    """Load full FluxPipeline (needed for text encoding + VAE)."""
     from diffusers import FluxPipeline
-    print(f"  [flux] loading full pipeline for text encoding …")
+    print(f"  [flux] loading full pipeline for text encoding + VAE …")
     pipe = FluxPipeline.from_pretrained(
         model_name, torch_dtype=dtype, token=HF_TOKEN,
     )
@@ -202,11 +303,8 @@ def make_ids(B: int, h: int, w: int, txt_seq: int, device, dtype):
 # Conditioning helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def null_cond(B: int, txt_seq: int, device, dtype):
-    """Zero embeddings — kept as fast fallback for single-sample inner loops."""
-    enc  = torch.zeros(B, txt_seq, 4096, device=device, dtype=dtype)
-    pool = torch.zeros(B, 768,     device=device, dtype=dtype)
-    return enc, pool
+def _needs_guidance(tr) -> bool:
+    return bool(getattr(tr.config, "guidance_embeds", False))
 
 
 class PromptBank:
@@ -217,41 +315,30 @@ class PromptBank:
     """
     def __init__(
         self,
-        enc_all:  torch.Tensor,   # (N, seq, 4096) on CPU
-        pool_all: torch.Tensor,   # (N, 768) on CPU
+        enc_all:  torch.Tensor,
+        pool_all: torch.Tensor,
         device: torch.device,
         dtype:  torch.dtype,
         seed:   int = 0,
     ):
-        self.enc   = enc_all
-        self.pool  = pool_all
-        self.N     = enc_all.shape[0]
+        self.enc     = enc_all
+        self.pool    = pool_all
+        self.N       = enc_all.shape[0]
         self.txt_seq = enc_all.shape[1]
         self.device  = device
         self.dtype   = dtype
         self.rng     = np.random.default_rng(seed)
 
     def sample(self, B: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (enc, pool) on device, shape (B, seq, 4096) / (B, 768)."""
-        idx = self.rng.integers(0, self.N, size=B)
+        idx  = self.rng.integers(0, self.N, size=B)
         enc  = self.enc[idx].to(device=self.device, dtype=self.dtype)
         pool = self.pool[idx].to(device=self.device, dtype=self.dtype)
-        return enc, pool
-
-    def get_one(self, i: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return conditioning for a single fixed index (for per-sample loops)."""
-        enc  = self.enc[i : i + 1].to(device=self.device, dtype=self.dtype)
-        pool = self.pool[i : i + 1].to(device=self.device, dtype=self.dtype)
         return enc, pool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Velocity prediction wrapper
 # ══════════════════════════════════════════════════════════════════════════════
-
-def _needs_guidance(tr) -> bool:
-    return bool(getattr(tr.config, "guidance_embeds", False))
-
 
 def flux_vel(
     tr,
@@ -299,7 +386,7 @@ def est_sigma2_eta(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# σ²_v̇(σ)  — saved as "sigma2_vdot_fd1"
+# σ²_v̇(σ)  [F2: adaptive half-step]
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -308,14 +395,19 @@ def est_sigma2_vdot_fd1(
     h, w, d, dsigma=0.025, guidance_val=3.5,
 ) -> float:
     """
-    D(σ) ≈ E‖(v_θ(x_{σ+dσ},σ+dσ) − v_θ(x_{σ−dσ},σ−dσ)) / (2·dσ)‖² / d
+    D(σ) ≈ E‖(v_θ(x_{σ+h},σ+h) − v_θ(x_{σ−h},σ−h)) / (2h)‖² / d
+
+    [F2] half-step h = min(dsigma, σ−ε, 1−σ−ε) so the difference quotient
+    is always a symmetric central difference, even near σ=0 / σ=1.
     Path-coherent: x_lo/x_hi share the same (x₀, ε).
     """
-    s_lo = max(0.0, sigma - dsigma)
-    s_hi = min(1.0, sigma + dsigma)
-    ds   = (s_hi - s_lo) / 2.0
-    if ds < 1e-6:
+    # [F2] adaptive half-step
+    half = min(dsigma, sigma - 1e-4, 1.0 - sigma - 1e-4)
+    if half < 1e-5:
         return 0.0
+
+    s_lo = sigma - half
+    s_hi = sigma + half
 
     B = x0.shape[0]
     enc, pool = prompt_bank.sample(B)
@@ -328,7 +420,7 @@ def est_sigma2_vdot_fd1(
     vlo   = flux_vel(tr, xlo, s_lo, enc, pool, img_ids, txt_ids, h, w, guidance_val)
     vhi   = flux_vel(tr, xhi, s_hi, enc, pool, img_ids, txt_ids, h, w, guidance_val)
 
-    vdot  = (vhi.float() - vlo.float()) / (2.0 * ds)
+    vdot  = (vhi.float() - vlo.float()) / (2.0 * half)
     return float((vdot ** 2).sum()) / (B * d)
 
 
@@ -340,29 +432,111 @@ def est_sigma2_vdot_fd1(
 def est_g_at_sigma(
     tr, sigma, x0_list, prompt_bank: PromptBank,
     h, w, d, n_probes=4, delta=0.005, guidance_val=3.5,
-) -> float:
-    """x0_list: iterable of (1, 16, H, W) tensors."""
-    trace = 0.0; count = 0
+) -> tuple[float, float, float]:
+    """
+    Returns (g_iso, g_sem, anisotropy_ratio).
+ 
+    g_iso  = (1/d) Tr(∇_x v̂)   via isotropic FD-Hutchinson  [original]
+    g_sem  = (1/d) u^T ∇_x v̂ u  along CFG semantic direction u [new]
+             u(x,σ) = (v_text – v_null) / ‖v_text – v_null‖_F
+ 
+    anisotropy_ratio = g_sem / (g_iso + ε)
+ 
+    If g_sem ≫ g_iso  →  Jacobian is highly anisotropic in the semantic
+    direction; isotropic Hutchinson under-weights semantic modes.
+ 
+    Forward-pass budget per sample:
+        baseline   : 1 (v_text, already used for g_iso probes)
+        null branch: 1  (v_null, for u construction)
+        g_iso probes: n_probes (random z, text branch only)
+        g_sem probe : 2  (text + null perturbed along u_norm)
+        total      : n_probes + 4
+    """
+    trace_iso = 0.0
+    trace_sem = 0.0
+    count     = 0
+ 
+    # pre-build null (zero) embeddings shape; reused across samples
+    # (actual null enc/pool built per-sample from enc shape)
     for xi in x0_list:
         xi  = xi.unsqueeze(0) if xi.dim() == 3 else xi
-        enc, pool = prompt_bank.sample(1)
-        img_ids, txt_ids = make_ids(1, h, w, enc.shape[1], xi.device, xi.dtype)
+        enc_text, pool_text = prompt_bank.sample(1)
+        img_ids, txt_ids = make_ids(
+            1, h, w, enc_text.shape[1], xi.device, xi.dtype)
+ 
+        # null conditioning: zero embeddings  (only for u-direction reference)
+        enc_null  = torch.zeros_like(enc_text)
+        pool_null = torch.zeros_like(pool_text)
+ 
         noise = torch.randn_like(xi)
         xs    = (1 - sigma) * xi + sigma * noise
-        v0    = flux_vel(tr, xs, sigma, enc, pool, img_ids, txt_ids, h, w, guidance_val)
+ 
+        # ── baseline velocities (2 fwds) ─────────────────────────────────────
+        v0_text = flux_vel(
+            tr, xs, sigma, enc_text, pool_text,
+            img_ids, txt_ids, h, w, guidance_val)
+        v0_null = flux_vel(
+            tr, xs, sigma, enc_null, pool_null,
+            img_ids, txt_ids, h, w, guidance_val)
+ 
+        # semantic direction  u ∈ R^d
+        u_raw  = v0_text.float() - v0_null.float()          # (1,C,H,W)
+        u_norm_val = u_raw.norm()
+        if u_norm_val < 1e-8:
+            # degenerate: text ≈ null  →  skip semantic probe this sample
+            u_unit = torch.randn_like(u_raw)
+            u_unit = u_unit / (u_unit.norm() + 1e-8)
+        else:
+            u_unit = u_raw / u_norm_val                      # unit vector
+ 
+        # ── isotropic Hutchinson probes  (n_probes fwds) ─────────────────────
         for _ in range(n_probes):
             z  = torch.randn_like(xs)
-            vp = flux_vel(tr, xs + delta * z, sigma, enc, pool,
-                          img_ids, txt_ids, h, w, guidance_val)
-            trace += float(((vp.float() - v0.float()) * z.float()).sum()) / delta
+            vp = flux_vel(
+                tr, xs + delta * z, sigma,
+                enc_text, pool_text, img_ids, txt_ids, h, w, guidance_val)
+            trace_iso += float(
+                ((vp.float() - v0_text.float()) * z.float()).sum()
+            ) / delta
             count += 1
             if xi.device.type == "cuda":
                 torch.cuda.empty_cache()
-    return trace / (count * d)
+ 
+        # ── directional probe along u  (2 fwds: text + null) ─────────────────
+        xs_u   = xs + delta * u_unit
+        vp_text_u = flux_vel(
+            tr, xs_u, sigma, enc_text, pool_text,
+            img_ids, txt_ids, h, w, guidance_val)
+        vp_null_u = flux_vel(
+            tr, xs_u, sigma, enc_null, pool_null,
+            img_ids, txt_ids, h, w, guidance_val)
+ 
+        # CFG-combined perturbed velocity (guidance direction consistent)
+        # For guidance-distilled FLUX: v̂ = single-forward with text+guidance
+        # We approximate the Jacobian along u using both branches so the
+        # direction probe is self-consistent with how u was constructed.
+        dv_text = (vp_text_u.float() - v0_text.float()) / delta   # ∇v_text · u
+        dv_null = (vp_null_u.float() - v0_null.float()) / delta   # ∇v_null · u
+ 
+        # Rayleigh quotient  u^T J u  for each branch, averaged
+        trace_sem += float((dv_text * u_unit).sum())               # text branch
+        # (null branch gives the "background" Jacobian component)
+        # record net semantic Jacobian as text-branch directional derivative
+        # (the quantity that enters the cost function is the text-cond predictor)
+ 
+        if xi.device.type == "cuda":
+            torch.cuda.empty_cache()
+ 
+    n_samples = len(x0_list)
+    g_iso  = trace_iso / (count * d)          # count = n_samples * n_probes
+    g_sem  = trace_sem / (n_samples * d)      # one directional probe per sample
+    ratio  = g_sem / (abs(g_iso) + 1e-8)
+    return g_iso, g_sem, ratio
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Cross-step velocity-error correlation  ρ̂_η(s)
+# [F1] prompt sampled OUTSIDE σ-loop
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -371,25 +545,30 @@ def est_rho_eta(
     h, w, d, guidance_val=3.5,
 ):
     """
+    [F1] enc/pool are drawn once per x0 sample (outside the σ-loop).
     Independent ε per σ point eliminates shared-noise floor artefact.
     Returns: C (covariance M×M), rho (normalised),
              delta_sigmas (upper-tri pairs), rho_pairs.
     """
-    M   = len(sigma_grid)
-    C   = np.zeros((M, M), dtype=np.float64)
-    n   = 0
+    M = len(sigma_grid)
+    C = np.zeros((M, M), dtype=np.float64)
+    n = 0
 
     for xi in x0_list:
-        xi   = xi.unsqueeze(0) if xi.dim() == 3 else xi
+        xi = xi.unsqueeze(0) if xi.dim() == 3 else xi
+
+        # [F1] sample prompt ONCE per x0, held fixed across all σ
+        enc, pool = prompt_bank.sample(1)
+        img_ids, txt_ids = make_ids(1, h, w, enc.shape[1], xi.device, xi.dtype)
+
         errs = []
         for s in sigma_grid:
-            enc, pool = prompt_bank.sample(1)
-            img_ids, txt_ids = make_ids(1, h, w, enc.shape[1], xi.device, xi.dtype)
-            noise = torch.randn_like(xi)
+            noise = torch.randn_like(xi)          # ε independent per σ ✓
             xs    = (1 - s) * xi + s * noise
             vp    = flux_vel(tr, xs, s, enc, pool, img_ids, txt_ids, h, w, guidance_val)
             e     = (vp.float() - (noise - xi).float()).squeeze(0).flatten().cpu().double()
             errs.append(e)
+
         for i in range(M):
             for j in range(i, M):
                 dot = (errs[i] * errs[j]).sum().item() / d
@@ -412,6 +591,7 @@ def est_rho_eta(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Cross-step velocity-acceleration correlation  ρ̂_v̇(s)
+# [F1] prompt outside σ-loop  [F2] adaptive half-step
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
@@ -421,6 +601,8 @@ def est_rho_vdot_fd1(
 ):
     """
     Path-coherent central-difference: same (x₀, ε) for lo/hi.
+    [F1] enc/pool sampled once per x0 outside the σ-loop.
+    [F2] adaptive half-step near boundaries.
     Returns: C, rho, delta_sigmas, rho_pairs.
     """
     M  = len(sigma_grid)
@@ -428,19 +610,23 @@ def est_rho_vdot_fd1(
     n  = 0
 
     for xi in x0_list:
-        xi    = xi.unsqueeze(0) if xi.dim() == 3 else xi
-        vdots = []
+        xi = xi.unsqueeze(0) if xi.dim() == 3 else xi
 
+        # [F1] sample prompt ONCE per x0
+        enc, pool = prompt_bank.sample(1)
+        img_ids, txt_ids = make_ids(1, h, w, enc.shape[1], xi.device, xi.dtype)
+
+        vdots = []
         for s in sigma_grid:
-            s_lo = max(0.0, s - dsigma)
-            s_hi = min(1.0, s + dsigma)
-            ds   = (s_hi - s_lo) / 2.0
-            if ds < 1e-6:
+            # [F2] adaptive half-step
+            half = min(dsigma, s - 1e-4, 1.0 - s - 1e-4)
+            if half < 1e-5:
                 vdots.append(None)
                 continue
 
-            enc, pool = prompt_bank.sample(1)
-            img_ids, txt_ids = make_ids(1, h, w, enc.shape[1], xi.device, xi.dtype)
+            s_lo = s - half
+            s_hi = s + half
+
             noise = torch.randn_like(xi)
             xlo   = (1 - s_lo) * xi + s_lo * noise
             xhi   = (1 - s_hi) * xi + s_hi * noise
@@ -448,7 +634,7 @@ def est_rho_vdot_fd1(
             vlo   = flux_vel(tr, xlo, s_lo, enc, pool, img_ids, txt_ids, h, w, guidance_val)
             vhi   = flux_vel(tr, xhi, s_hi, enc, pool, img_ids, txt_ids, h, w, guidance_val)
 
-            vd    = (vhi.float() - vlo.float()) / (2.0 * ds)
+            vd    = (vhi.float() - vlo.float()) / (2.0 * half)
             vdots.append(vd.squeeze(0).flatten().cpu().double())
 
         for i in range(M):
@@ -481,18 +667,6 @@ def _extract_rho_infty(
     rho_s: np.ndarray,
     rho_vals: np.ndarray,
 ) -> float:
-    """
-    Detect the long-lag plateau of ρ(s) and return ρ_∞.
-
-    Algorithm
-    ---------
-    1. Slide a window of size MIN_FLAT; find the first index where all
-       relative increments |Δρ/ρ| < 2 %.
-    2. Extend the plateau window until ρ drops more than 5 % below its
-       value at the plateau start.
-    3. Return the median over the plateau window.
-    4. Emit a UserWarning if the plateau CV > 5 % (unreliable estimate).
-    """
     drho     = np.abs(np.diff(rho_vals))
     rel_drho = drho / (np.abs(rho_vals[:-1]) + 1e-8)
     MIN_FLAT = max(5, len(rho_vals) // 10)
@@ -503,10 +677,7 @@ def _extract_rho_infty(
             plateau_start = i
             break
     if plateau_start is None:
-        warnings.warn(
-            "[stats_flux] No plateau found — extend rho_s range.",
-            UserWarning,
-        )
+        warnings.warn("[stats_flux] No plateau found — extend rho_s range.", UserWarning)
         plateau_start = len(rho_vals) // 2
 
     rho_at_start = rho_vals[plateau_start]
@@ -537,10 +708,6 @@ def _extract_rho_curve_viz(
     n_bins: int = 40,
     anchor_at_one: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Smooth the scatter (dl, rp) → (s, ρ) curve for visualisation only.
-    Uses percentile binning + Pchip interpolation with monotone-clamp.
-    """
     valid = dl > 0
     if valid.sum() < 5:
         return np.linspace(0, 1, 5), np.ones(5)
@@ -577,10 +744,6 @@ def analyse_plateau(
     rho_vals: np.ndarray,
     label: str = "",
 ) -> dict:
-    """
-    Full plateau analysis for one correlation curve.
-    Uses _extract_rho_infty for the scalar ρ_∞ estimate.
-    """
     ri   = _extract_rho_infty(rho_s, rho_vals)
     rr   = np.clip(rho_vals - ri, 0.0, None)
     rn   = rr / max(rr[0], 1e-8)
@@ -629,7 +792,6 @@ def _visualize(
     fig = plt.figure(figsize=(18, 12))
     gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.38)
 
-    # Row 0 — g(σ)
     ax = fig.add_subplot(gs[0, 0])
     if g_vals is not None and g_vals.any():
         ax.plot(sigma_grid, g_vals, color="#2d6a9f", lw=2)
@@ -640,14 +802,12 @@ def _visualize(
     ax.set_xlabel("σ"); ax.set_ylabel("g(σ)")
     ax.set_title("Scalar Jacobian Proxy  g(σ)"); ax.grid(True, alpha=0.3)
 
-    # Row 0 — variances
     ax = fig.add_subplot(gs[0, 1])
     ax.semilogy(sigma_grid, s2_eta,  color="#b5451b", lw=2,   label="σ²_η (vel-err)")
     ax.semilogy(sigma_grid, s2_vdot, color="#9b3fa0", lw=2, ls="--", label="σ²_v̇_fd1 (disc)")
     ax.set_xlabel("σ"); ax.set_title("Error Variances σ²_η & σ²_v̇_fd1")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.3, which="both")
 
-    # Row 0 — ρ̂_η global
     ax = fig.add_subplot(gs[0, 2])
     ax.scatter(dl_eta, rp_eta, s=4, alpha=0.2, color="#999", rasterized=True)
     ax.plot(rho_s_eta, rho_eta, color="#2d6a9f", lw=2.5, label="global ρ̂_η")
@@ -657,7 +817,6 @@ def _visualize(
     ax.set_xlabel("|Δσ|"); ax.set_ylabel("ρ̂"); ax.set_title("Score-approx error  ρ̂_η(s)")
     ax.legend(fontsize=8); ax.set_ylim(-0.05, 1.05); ax.grid(True, alpha=0.3)
 
-    # Row 1 — Stationarity CV
     ax = fig.add_subplot(gs[1, 0])
     ax.plot(s_common, cv_s, color="#555", lw=2)
     ax.axhline(0.15, color="#2a7d4f", lw=1.2, ls="--", label="0.15 stationary")
@@ -669,7 +828,6 @@ def _visualize(
     ax.set_xlabel("s"); ax.set_ylabel("CV")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.2)
 
-    # Row 1 — Per-segment ρ̂_η
     ax = fig.add_subplot(gs[1, 1])
     ax.plot(rho_s_eta, rho_eta, color="k", lw=2, ls="--", alpha=0.5, label="global")
     for k, (rs, rv) in enumerate(seg_curves):
@@ -679,15 +837,6 @@ def _visualize(
     ax.set_xlabel("|Δσ|"); ax.set_title("Per-Segment  ρ̂_η(s)")
     ax.legend(fontsize=8); ax.set_ylim(-0.05, 1.05); ax.grid(True, alpha=0.3)
 
-    # Row 1 — Cost proxy
-    ax = fig.add_subplot(gs[1, 2])
-    cost_proxy = s2_eta * (1.0 - sigma_grid) ** 2
-    ax.plot(sigma_grid, cost_proxy, color="#2a7d4f", lw=2)
-    ax.set_xlabel("σ")
-    ax.set_title("Schedule Cost Proxy  σ²_η·(1–σ)²")
-    ax.grid(True, alpha=0.3)
-
-    # Row 2 — ρ̂_v̇ (discretisation-error correlation)
     ax = fig.add_subplot(gs[2, 0])
     if len(dl_vdot) > 0 and len(rho_s_vd) > 1:
         ax.scatter(dl_vdot, rp_vdot, s=4, alpha=0.2, color="#999", rasterized=True)
@@ -703,7 +852,6 @@ def _visualize(
     ax.set_title("Disc-error  ρ̂_v̇_fd1(s)")
     ax.set_ylim(-0.15, 1.05); ax.grid(True, alpha=0.3)
 
-    # Row 2 — Rank-1 comparison
     ax = fig.add_subplot(gs[2, 1])
     labels = ["score-approx ρ_∞"]
     vals   = [plateau_eta["rho_infty"] if plateau_eta else 0.0]
@@ -719,7 +867,6 @@ def _visualize(
     ax.set_title("Rank-1 Plateau Comparison")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.2, axis="y")
 
-    # Row 2 — Summary
     ax = fig.add_subplot(gs[2, 2])
     ax.axis("off")
     pe  = plateau_eta  or {}
@@ -765,14 +912,24 @@ def run_estimation(args):
     dtype = torch.bfloat16
     print(f"[stats_flux] device={device}  model={args.model}")
 
-    # ── σ grid ───────────────────────────────────────────────────────────────
-    n_lo = args.n_sigma // 3
-    n_hi = args.n_sigma - n_lo
-    sg   = np.concatenate([
-        np.linspace(0.01, 0.35, n_lo, endpoint=False),
-        np.linspace(0.35, 0.99, n_hi),
+    # ── Load full pipeline ────────────────────────────────────────────────────
+    pipe = load_flux_pipeline(args.model, device, dtype)
+    
+    # ── [F4] Query actual Flux sigma range ───────────────────────────────────
+    actual_sigma_min, actual_sigma_max = get_flux_sigma_range(pipe, args.latent_size, nfe=50)
+
+    # ── σ grid: use actual scheduler range ───────────────────────────────────
+    # Keep finer spacing near low-σ end where costs vary rapidly
+    sg_min = max(actual_sigma_min, 1e-3)
+    sg_max = min(actual_sigma_max, 1.0 - 1e-3)
+    n_lo   = args.n_sigma // 3
+    n_hi   = args.n_sigma - n_lo
+    sg     = np.concatenate([
+        np.linspace(sg_min,  0.35, n_lo, endpoint=False),
+        np.linspace(0.35,    sg_max, n_hi),
     ])
-    print(f"  σ grid: {len(sg)} points  [{sg[0]:.3f}, {sg[-1]:.3f}]")
+    print(f"  σ grid: {len(sg)} points  [{sg[0]:.4f}, {sg[-1]:.4f}]  "
+          f"(aligned to Flux scheduler range)")
 
     h, w    = args.latent_size, args.latent_size
     d       = 16 * h * w
@@ -780,8 +937,6 @@ def run_estimation(args):
     guidance_val = args.guidance
     print(f"  latent: 16×{h}×{w}  d={d:,}  txt_seq={txt_seq}")
 
-    # ── Load full pipeline (needed for text encoding) ─────────────────────────
-    pipe = load_flux_pipeline(args.model, device, dtype)
     tr   = pipe.transformer
     for m in tr.modules():
         if isinstance(m, torch.nn.Dropout):
@@ -794,7 +949,6 @@ def run_estimation(args):
     enc_all, pool_all = encode_prompts_flux(
         pipe, captions, device, dtype, batch_size=args.encode_batch,
     )
-    # txt_seq might differ from the actual encoded length; update
     actual_txt_seq = enc_all.shape[1]
     if actual_txt_seq != txt_seq:
         print(f"  [prompts] actual txt_seq={actual_txt_seq} "
@@ -803,7 +957,7 @@ def run_estimation(args):
 
     prompt_bank = PromptBank(enc_all, pool_all, device, dtype, seed=args.seed)
 
-    # Offload text encoders to save VRAM (transformer is all we need now)
+    # Offload text encoders
     if hasattr(pipe, "text_encoder"):
         pipe.text_encoder.cpu()
     if hasattr(pipe, "text_encoder_2"):
@@ -811,9 +965,12 @@ def run_estimation(args):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # ── Random latent "data" ─────────────────────────────────────────────────
-    print(f"  generating {args.n_samples} random latents …")
-    x0_all = torch.randn(args.n_samples, 16, h, w, device=device, dtype=dtype)
+    # ── [F3] Real VAE latents ─────────────────────────────────────────────────
+    x0_all = encode_images_to_latents(
+        pipe, args.n_samples, device, dtype,
+        latent_size=h, seed=args.seed,
+    )
+    # VAE already offloaded inside encode_images_to_latents
 
     # ── σ²_η(σ) ──────────────────────────────────────────────────────────────
     print(f"\n[stats_flux] σ²_η at {len(sg)} σ points …")
@@ -828,7 +985,7 @@ def run_estimation(args):
         if (k + 1) % max(1, len(sg) // 8) == 0:
             print(f"  σ²_η  {k+1}/{len(sg)}  σ={s:.3f}  val={s2_eta[k]:.4e}")
 
-    # ── σ²_v̇_fd1(σ) ───────────────────────────────────────────────────────────
+    # ── σ²_v̇_fd1(σ)  [F2] ─────────────────────────────────────────────────────
     print(f"\n[stats_flux] σ²_v̇_fd1 at {len(sg)} σ points …")
     s2_vdot = np.zeros(len(sg))
     for k, s in enumerate(sg):
@@ -843,26 +1000,31 @@ def run_estimation(args):
         if (k + 1) % max(1, len(sg) // 8) == 0:
             print(f"  σ²_v̇_fd1  {k+1}/{len(sg)}  σ={s:.3f}  val={s2_vdot[k]:.4e}")
 
-    wl           = min(7, (len(sg) // 4) * 2 + 1)
-    log_vd       = savgol_filter(np.log(np.clip(s2_vdot, 1e-30, None)), wl, 2)
-    s2_vdot_sm   = np.exp(log_vd)
+    wl         = min(7, (len(sg) // 4) * 2 + 1)
+    log_vd     = savgol_filter(np.log(np.clip(s2_vdot, 1e-30, None)), wl, 2)
+    s2_vdot_sm = np.exp(log_vd)
 
     # ── g(σ) ─────────────────────────────────────────────────────────────────
     g_vals = np.zeros(len(sg), dtype=np.float32)
     if not args.no_g:
-        n_g   = min(args.n_g_samples, args.n_samples)
-        x0_g  = [x0_all[i] for i in range(n_g)]
+        n_g  = min(args.n_g_samples, args.n_samples)
+        x0_g = [x0_all[i] for i in range(n_g)]
         print(f"\n[stats_flux] g(σ)  n_g_samples={n_g}  n_probes={args.n_hutchinson} …")
         for k, s in enumerate(sg):
-            g_vals[k] = est_g_at_sigma(
+            g_vals[k], g_sem, ratio = est_g_at_sigma(
                 tr, s, x0_g, prompt_bank, h, w, d,
-                n_probes=args.n_hutchinson, delta=args.g_delta,
+                n_probes=args.n_hutchinson,
+                delta=args.g_delta,
                 guidance_val=guidance_val,
             )
-            if (k + 1) % max(1, len(sg) // 8) == 0:
-                print(f"  g  {k+1}/{len(sg)}  σ={s:.3f}  g={g_vals[k]:.5f}")
 
-    # ── ρ̂_η — score-approximation-error correlation ──────────────────────────
+            if (k + 1) % max(1, len(sg) // 8) == 0:
+                print(f"  g  {k+1}/{len(sg)}  σ={s:.3f}  "
+                    f"g_iso={g_vals[k]:.5f}  "
+                    f"g_sem={g_sem:.5f}  "
+                    f"ratio={ratio:.3f}")
+
+    # ── ρ̂_η  [F1] ─────────────────────────────────────────────────────────────
     n_ell  = min(args.n_ell_samples, args.n_samples)
     x0_ell = [x0_all[i] for i in range(n_ell)]
     print(f"\n[stats_flux] ρ̂_η  ({n_ell} samples) …")
@@ -871,7 +1033,7 @@ def run_estimation(args):
     rho_s_eta, rho_eta = _extract_rho_curve_viz(dl_eta, rp_eta, anchor_at_one=True)
     plateau_eta = analyse_plateau(rho_s_eta, rho_eta, "score-approx error η")
 
-    # ── ρ̂_v̇_fd1 — discretisation-error correlation ───────────────────────────
+    # ── ρ̂_v̇_fd1  [F1, F2] ────────────────────────────────────────────────────
     dl_vdot = rp_vdot = np.array([])
     rho_s_vd = rho_vd = np.array([0.0, 1.0])
     plateau_vdot = None
@@ -927,22 +1089,23 @@ def run_estimation(args):
     print(f"  mean CV={mean_cv:.3f}  →  {stat_verdict}")
     verify_stationarity(rho_s_eta, rho_eta, sg, nfe_list=(4, 8, 16, 28, 50))
 
-    # ── Save .npz ─────────────────────────────────────────────────────────────
+    # ── Save .npz  [F4: use actual scheduler sigma range] ─────────────────────
     safe = args.model.replace("/", "--").replace(":", "--")
     out  = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     npz  = out / f"{safe}.npz"
 
     save = dict(
-        # ── FM-native keys ────────────────────────────────────────────────
+        # FM-native keys
         t_grid              = sg.astype(np.float32),
-        sigma_min           = np.float32(sg[0]),
-        sigma_max           = np.float32(sg[-1]),
+        # [F4] actual Flux scheduler boundaries, not hand-tuned grid endpoints
+        sigma_min           = np.float32(actual_sigma_min),
+        sigma_max           = np.float32(actual_sigma_max),
         sigma2_eta          = s2_eta.astype(np.float32),
-        sigma2_vdot_fd1     = s2_vdot_sm.astype(np.float32),  
+        sigma2_vdot_fd1     = s2_vdot_sm.astype(np.float32),
         g_values            = g_vals.astype(np.float32),
         rho_s               = rho_s_eta.astype(np.float32),
-        rho_values          = rho_eta.astype(np.float32), 
+        rho_values          = rho_eta.astype(np.float32),
     )
     if plateau_vdot is not None:
         save["rho_s_gpp"]      = rho_s_vd.astype(np.float32)
@@ -952,7 +1115,6 @@ def run_estimation(args):
     print(f"\n[stats_flux] saved → {npz}")
     print(f"  Keys: {list(save.keys())}")
 
-    # Save raw correlation matrices
     np.save(str(out / f"{safe}_rhomat_eta.npy"),
             rho_mat_eta.astype(np.float32))
     if rho_mat_vdot is not None:
@@ -975,7 +1137,8 @@ def run_estimation(args):
     print(f"  model           : {args.model}")
     print(f"  d               : {d:,}   (latent 16×{h}×{w})")
     print(f"  prompts         : {len(captions)} COCO captions")
-    print(f"  σ grid          : [{sg[0]:.3f}, {sg[-1]:.3f}]  N={len(sg)}")
+    print(f"  σ grid          : [{sg[0]:.4f}, {sg[-1]:.4f}]  N={len(sg)}")
+    print(f"  σ_min/max (sched): [{actual_sigma_min:.5f}, {actual_sigma_max:.5f}]")
     print(f"  σ²_η range      : [{s2_eta.min():.3e}, {s2_eta.max():.3e}]")
     print(f"  σ²_v̇_fd1 range  : [{s2_vdot_sm.min():.3e}, {s2_vdot_sm.max():.3e}]")
     print(f"  ρ_∞(η)          : {plateau_eta['rho_infty']:.4f}  "

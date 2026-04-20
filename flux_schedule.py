@@ -246,22 +246,55 @@ def _numerical_gradient(
     return grad
 
 
-def _project_ordering(
-    interior: np.ndarray,
+# def _project_ordering(
+#     interior: np.ndarray,
+#     sigma_max: float,
+#     sigma_min: float,
+#     min_gap: float,
+# ) -> np.ndarray:
+#     """Enforce strict decreasing order with min_gap from boundaries."""
+#     x = -np.sort(-interior.copy())   # descending
+#     n = len(x)
+#     for i in range(n):
+#         lo = sigma_min + (n - i) * min_gap
+#         hi = sigma_max - (i + 1) * min_gap
+#         x[i] = float(np.clip(x[i], lo, hi))
+#     return x
+
+# ── Softmax Reparameterization ──────────────────
+def _alpha_to_sigmas(alpha: np.ndarray,
+                     sigma_max: float,
+                     sigma_min: float) -> np.ndarray:
+    """
+    alpha ∈ R^N  (unconstrained)
+    h_i = softmax(alpha)_i · (sigma_max - sigma_min)   
+    sigmas = [sigma_max, sigma_max - h_1, ..., sigma_min]   
+    """
+    span = sigma_max - sigma_min
+    a    = alpha - alpha.max()       
+    h    = np.exp(a) / np.exp(a).sum() * span
+    interior = sigma_max - np.cumsum(h)[:-1]
+    return np.concatenate([[sigma_max], interior, [sigma_min]])
+
+def _grad_alpha(
+    alpha: np.ndarray,
     sigma_max: float,
     sigma_min: float,
-    min_gap: float,
+    barrier_weight: float,
+    fd_h: float,
+    **cost_kw,
 ) -> np.ndarray:
-    """Enforce strict decreasing order with min_gap from boundaries."""
-    x = -np.sort(-interior.copy())   # descending
-    n = len(x)
-    for i in range(n):
-        lo = sigma_min + (n - i) * min_gap
-        hi = sigma_max - (i + 1) * min_gap
-        x[i] = float(np.clip(x[i], lo, hi))
-    return x
-
-
+    """FD gradient w.r.t. alpha."""
+    grad = np.zeros_like(alpha)
+    for i in range(len(alpha)):
+        ap = alpha.copy(); ap[i] += fd_h
+        am = alpha.copy(); am[i] -= fd_h
+        cp = _cost_functional(_alpha_to_sigmas(ap, sigma_max, sigma_min),
+                              barrier_weight=barrier_weight, **cost_kw)
+        cm = _cost_functional(_alpha_to_sigmas(am, sigma_max, sigma_min),
+                              barrier_weight=barrier_weight, **cost_kw)
+        grad[i] = (cp - cm) / (2.0 * fd_h)
+    return grad
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Stats helper
@@ -313,6 +346,8 @@ def _load_stats(npz_path: str):
     g_arr  = data.get("g_values").astype(np.float64)
     rho_s  = data.get("rho_s").astype(np.float64)
     rho_v  = data.get("rho_values").astype(np.float64)
+    sigma_max = data.get("sigma_max").astype(np.float64)
+    sigma_min = data.get("sigma_min").astype(np.float64)
 
     _s2    = PchipInterpolator(t_grid, s2_eta, extrapolate=True)
     _s2vd  = PchipInterpolator(t_grid, s2_vd,  extrapolate=True)
@@ -325,7 +360,7 @@ def _load_stats(npz_path: str):
     rho_infty = _extract_rho_infty(rho_s, rho_v)
     phi_res   = _build_phi_res_fn(rho_s, rho_v, rho_infty, quad_pts=64)
 
-    return sigma2_fn, sigma2_vdot_fn, g_fn, phi_res, rho_infty
+    return sigma2_fn, sigma2_vdot_fn, g_fn, phi_res, rho_infty, sigma_max, sigma_min
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -342,7 +377,7 @@ def optimize_schedule(
     lr_decay: float       = 0.995,
     min_gap: float        = 1e-4,
     barrier_weight: float = 0.0,
-    fd_h: float           = 1e-5,
+    fd_h: float           = 1e-3,
     n_quad: int           = 32,
     w_rank1: float        = 1.0,
     w_vres:  float        = 1.0,
@@ -354,9 +389,12 @@ def optimize_schedule(
     Returns optimal sigmas array (length nfe+1, strictly decreasing).
     Algorithm: Adam + logit reparametrisation + ordering projection, multi-restart.
     """
-    sigma2_fn, sigma2_vdot_fn, g_fn, phi_res, rho_infty = _load_stats(npz_path)
+    sigma2_fn, sigma2_vdot_fn, g_fn, phi_res, rho_infty, sigma_max, sigma_min = _load_stats(npz_path)
     if verbose:
         print(f"  ρ_∞(η) = {rho_infty:.4f}  [disc rank-1 dropped: ρ_∞^d ≈ 0]")
+
+    if barrier_weight == 0.0:
+        barrier_weight = 1e-3 * nfe / 8.0   # NFE=8→1e-3, NFE=12→1.5e-3, NFE=20→2.5e-3
 
     cost_kw = dict(
         g_fn=g_fn, sigma2_fn=sigma2_fn, sigma2_vdot_fn=sigma2_vdot_fn,
@@ -366,60 +404,103 @@ def optimize_schedule(
     )
     grad_kw = dict(sigma_max=sigma_max, sigma_min=sigma_min, fd_h=fd_h, **cost_kw)
 
-    span = sigma_max - sigma_min
+    # span = sigma_max - sigma_min
 
-    def _to_sigma(u):
-        return np.clip(sigma_min + span / (1.0 + np.exp(-u)),
-                       sigma_min + 1e-6, sigma_max - 1e-6)
+    # def _to_sigma(u):
+    #     return np.clip(sigma_min + span / (1.0 + np.exp(-u)),
+    #                    sigma_min + 1e-6, sigma_max - 1e-6)
 
-    def _to_u(s):
-        p = np.clip((s - sigma_min) / span, 1e-6, 1 - 1e-6)
-        return np.log(p / (1.0 - p))
+    # def _to_u(s):
+    #     p = np.clip((s - sigma_min) / span, 1e-6, 1 - 1e-6)
+    #     return np.log(p / (1.0 - p))
 
-    def _cost_u(u):
-        interior = _project_ordering(_to_sigma(u), sigma_max, sigma_min, min_gap)
-        return _cost_functional(np.concatenate([[sigma_max], interior, [sigma_min]]),
-                                **cost_kw)
+    # def _cost_u(u):
+    #     interior = _project_ordering(_to_sigma(u), sigma_max, sigma_min, min_gap)
+    #     return _cost_functional(np.concatenate([[sigma_max], interior, [sigma_min]]),
+    #                             **cost_kw)
 
-    def _grad_u(u):
-        s   = _project_ordering(_to_sigma(u), sigma_max, sigma_min, min_gap)
-        raw = _numerical_gradient(s, **grad_kw)
-        p   = (s - sigma_min) / span
-        return raw * p * (1.0 - p) * span   # chain-rule through logistic
+    # def _grad_u(u):
+    #     s   = _project_ordering(_to_sigma(u), sigma_max, sigma_min, min_gap)
+    #     raw = _numerical_gradient(s, **grad_kw)
+    #     p   = (s - sigma_min) / span
+    #     return raw * p * (1.0 - p) * span   # chain-rule through logistic
 
-    N_int      = nfe - 1
+    # N_int      = nfe - 1
     best_cost  = float("inf")
     best_sigmas = None
 
+    # for restart in range(n_restarts):
+    #   init = np.linspace(sigma_max, sigma_min, nfe + 1)[1:-1]
+    #   if restart > 0:
+    #       init = _project_ordering(
+    #           init + np.random.randn(N_int) * span * 0.05,
+    #           sigma_max, sigma_min, min_gap)
+    #     u  = _to_u(init)
+    #     m  = np.zeros_like(u)
+    #     v  = np.zeros_like(u)
+    #     β1, β2, ε_a = 0.9, 0.999, 1e-8
+    #     lr_t = lr; plateau = 0; cost_prev = float("inf")
+
+    #     for step in range(1, n_steps + 1):
+    #         g_vec = _grad_u(u)
+    #         m     = β1*m + (1-β1)*g_vec
+    #         v     = β2*v + (1-β2)*g_vec**2
+    #         u    -= lr_t * (m/(1-β1**step)) / (np.sqrt(v/(1-β2**step)) + ε_a)
+    #         lr_t *= lr_decay
+
+    #         cost = _cost_u(u)
+    #         if verbose and step % max(1, n_steps//10) == 0:
+    #             interior = _project_ordering(_to_sigma(u), sigma_max, sigma_min, min_gap)
+    #             eps_  = np.array([_compute_epsilon_fm(
+    #                 np.concatenate([[sigma_max], interior, [sigma_min]])[k-1],
+    #                 np.concatenate([[sigma_max], interior, [sigma_min]])[k], g_fn)
+    #                 for k in range(1, nfe+1)])
+    #             Gam_  = _compute_gamma(eps_)
+    #             print(f"  [r{restart}] step {step:4d}  cost={cost:.4e}  "
+    #                   f"γ∈[{Gam_.min():.3f},{Gam_.max():.3f}]")
+
+    #         rel = abs(cost_prev - cost) / (abs(cost_prev) + 1e-12)
+    #         plateau = (plateau + 1) if rel < 1e-7 else 0
+    #         if plateau > 50:
+    #             if verbose: print(f"  [r{restart}] early stop @ step {step}")
+    #             break
+    #         cost_prev = cost
+
+    #     interior = _project_ordering(_to_sigma(u), sigma_max, sigma_min, min_gap)
+    #     final_s  = np.concatenate([[sigma_max], interior, [sigma_min]])
+    #     c        = _cost_functional(final_s, **cost_kw)
+    #     if c < best_cost:
+    #         best_cost   = c
+    #         best_sigmas = final_s.copy()
+    #         if verbose: print(f"  [r{restart}] ★ best={best_cost:.4e}")
+
+    # return best_sigmas
     for restart in range(n_restarts):
-        init = np.linspace(sigma_max, sigma_min, nfe + 1)[1:-1]
+        alpha = np.zeros(nfe)
         if restart > 0:
-            init = _project_ordering(
-                init + np.random.randn(N_int) * span * 0.05,
-                sigma_max, sigma_min, min_gap)
-        u  = _to_u(init)
-        m  = np.zeros_like(u)
-        v  = np.zeros_like(u)
+            alpha += np.random.randn(nfe) * 0.5   
+
+        m  = np.zeros_like(alpha)
+        v  = np.zeros_like(alpha)
         β1, β2, ε_a = 0.9, 0.999, 1e-8
         lr_t = lr; plateau = 0; cost_prev = float("inf")
 
         for step in range(1, n_steps + 1):
-            g_vec = _grad_u(u)
-            m     = β1*m + (1-β1)*g_vec
-            v     = β2*v + (1-β2)*g_vec**2
-            u    -= lr_t * (m/(1-β1**step)) / (np.sqrt(v/(1-β2**step)) + ε_a)
+            g_vec = _grad_alpha(alpha, sigma_max, sigma_min,
+                                barrier_weight, fd_h, **cost_kw)
+            m   = β1*m + (1-β1)*g_vec
+            v   = β2*v + (1-β2)*g_vec**2
+            alpha -= lr_t * (m/(1-β1**step)) / (np.sqrt(v/(1-β2**step)) + ε_a)
             lr_t *= lr_decay
 
-            cost = _cost_u(u)
+            sigmas = _alpha_to_sigmas(alpha, sigma_max, sigma_min)
+            cost   = _cost_functional(sigmas, barrier_weight=barrier_weight, **cost_kw)
+
             if verbose and step % max(1, n_steps//10) == 0:
-                interior = _project_ordering(_to_sigma(u), sigma_max, sigma_min, min_gap)
-                eps_  = np.array([_compute_epsilon_fm(
-                    np.concatenate([[sigma_max], interior, [sigma_min]])[k-1],
-                    np.concatenate([[sigma_max], interior, [sigma_min]])[k], g_fn)
-                    for k in range(1, nfe+1)])
-                Gam_  = _compute_gamma(eps_)
+                h = sigmas[:-1] - sigmas[1:]
                 print(f"  [r{restart}] step {step:4d}  cost={cost:.4e}  "
-                      f"γ∈[{Gam_.min():.3f},{Gam_.max():.3f}]")
+                      f"h∈[{h.min():.4f},{h.max():.4f}]  "
+                      f"h_cv={h.std()/h.mean():.3f}")   # CV
 
             rel = abs(cost_prev - cost) / (abs(cost_prev) + 1e-12)
             plateau = (plateau + 1) if rel < 1e-7 else 0
@@ -428,125 +509,13 @@ def optimize_schedule(
                 break
             cost_prev = cost
 
-        interior = _project_ordering(_to_sigma(u), sigma_max, sigma_min, min_gap)
-        final_s  = np.concatenate([[sigma_max], interior, [sigma_min]])
-        c        = _cost_functional(final_s, **cost_kw)
+        sigmas = _alpha_to_sigmas(alpha, sigma_max, sigma_min)
+        c      = _cost_functional(sigmas, barrier_weight=barrier_weight, **cost_kw)
         if c < best_cost:
             best_cost   = c
-            best_sigmas = final_s.copy()
+            best_sigmas = sigmas.copy()
             if verbose: print(f"  [r{restart}] ★ best={best_cost:.4e}")
 
     return best_sigmas
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Diagnostics
-# ══════════════════════════════════════════════════════════════════════════════
-
-def diagnose_schedule(
-    sigmas: np.ndarray,
-    npz_path: str,
-    label: str = "BornSchedule",
-    out_path: Optional[str] = None,
-) -> dict:
-    sigma2_fn, sigma2_vdot_fn, g_fn, phi_res, rho_infty = _load_stats(npz_path)
-
-    N   = len(sigmas) - 1
-    eps = np.array([_compute_epsilon_fm(sigmas[k-1], sigmas[k], g_fn)
-                    for k in range(1, N+1)])
-    Gam = _compute_gamma(eps)
-    a_  = np.array([_compute_a_j(sigmas[k-1], sigmas[k], sigma2_fn)
-                    for k in range(1, N+1)])
-    V_  = np.array([_compute_V_res_fm(sigmas[k-1], sigmas[k], sigma2_fn, phi_res)
-                    for k in range(1, N+1)])
-    D_  = np.array([_compute_D_j(sigmas[k-1], sigmas[k], sigma2_vdot_fn)
-                    for k in range(1, N+1)])
-    I_  = Gam**2 * (V_ + D_)
-    h_  = sigmas[:-1] - sigmas[1:]
-
-    print(f"\n  ── {label}  NFE={N}  ρ_∞={rho_infty:.4f} ─────────────────────")
-    print(f"  {'j':>3}  {'σ_prev':>7}  {'σ_curr':>7}  {'h_j':>7}  "
-          f"{'γ_j':>7}  {'a_j':>9}  {'V_j^res':>9}  {'D_j':>9}  {'I_j':>9}")
-    for k in range(N):
-        print(f"  {k+1:>3}  {sigmas[k]:>7.4f}  {sigmas[k+1]:>7.4f}  {h_[k]:>7.4f}  "
-              f"{Gam[k]:>7.4f}  {a_[k]:>9.3e}  {V_[k]:>9.3e}  "
-              f"{D_[k]:>9.3e}  {I_[k]:>9.3e}")
-
-    r1    = rho_infty * float(np.dot(a_, Gam))**2
-    vt    = float(np.dot(V_, Gam**2))
-    dt    = float(np.dot(D_, Gam**2))
-    total = r1 + vt + dt
-    print(f"\n  Cost breakdown:")
-    print(f"    rank-1 (score) : {r1:.4e}  ({100*r1/total:.1f}%)")
-    print(f"    V_j^res        : {vt:.4e}  ({100*vt/total:.1f}%)")
-    print(f"    D_j            : {dt:.4e}  ({100*dt/total:.1f}%)")
-    print(f"    TOTAL          : {total:.4e}")
-    print(f"  γ ∈ [{Gam.min():.4f}, {Gam.max():.4f}]   "
-          f"h ∈ [{h_.min():.4f}, {h_.max():.4f}]")
-
-    if out_path:
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle(f"{label}  NFE={N}", fontsize=12)
-
-        ax = axes[0, 0]
-        h_unif = (sigmas[0]-sigmas[-1])/N
-        ax.bar(range(1, N+1), h_, color="#2d6a9f", alpha=0.8)
-        ax.axhline(h_unif, color="#e05c00", lw=1.5, ls="--",
-                   label=f"uniform h={h_unif:.3f}")
-        ax.set_xlabel("step j"); ax.set_ylabel("h_j")
-        ax.set_title("Step Sizes h_j"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-
-        ax = axes[0, 1]
-        ax.plot(range(1, N+1), Gam, "o-", color="#b5451b", lw=2)
-        ax.axhline(1.0, color="gray", lw=0.8, ls="--")
-        ax.set_xlabel("step j"); ax.set_ylabel("γ_j")
-        ax.set_title("Propagator γ_j"); ax.grid(True, alpha=0.3)
-
-        ax = axes[1, 0]
-        width = 0.35; x = np.arange(1, N+1)
-        ax.bar(x - width/2, Gam**2 * V_, width, label="γ²V^res", color="#2d6a9f", alpha=0.8)
-        ax.bar(x + width/2, Gam**2 * D_, width, label="γ²D",     color="#9b3fa0", alpha=0.8)
-        ax.set_xlabel("step j"); ax.set_title("Per-step cost γ²V & γ²D")
-        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-
-        ax = axes[1, 1]
-        sigma_unif = np.linspace(sigmas[0], sigmas[-1], N+1)
-        ax.plot(range(N+1), sigmas,     "o-",  color="#2d6a9f", lw=2, label=label)
-        ax.plot(range(N+1), sigma_unif, "s--", color="#e05c00", lw=1.5,
-                alpha=0.7, label="uniform")
-        ax.set_xlabel("step"); ax.set_ylabel("σ")
-        ax.set_title("σ Schedule"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        print(f"  [diag] → {out_path}")
-
-    return dict(sigmas=sigmas, gamma=Gam, h=h_, a=a_, V=V_, D=D_, importance=I_)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Diffusers injection
-# ══════════════════════════════════════════════════════════════════════════════
-
-def sigmas_to_flux_scheduler(
-    sigmas: np.ndarray,
-    model_name: str = "black-forest-labs/FLUX.1-dev",
-    device: str = "cpu",
-):
-    """
-    Inject custom σ schedule into FlowMatchEulerDiscreteScheduler.
-
-        sched = sigmas_to_flux_scheduler(optimal_sigmas, model_name)
-        pipeline.scheduler = sched
-        images = pipeline(prompt=..., num_inference_steps=nfe).images
-    """
-    from diffusers import FlowMatchEulerDiscreteScheduler
-    import torch
-    sched = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        model_name, subfolder="scheduler")
-    ts = torch.tensor(sigmas, dtype=torch.float32, device=device)
-    sched.timesteps = ts
-    sched.sigmas    = ts
-    return sched
 

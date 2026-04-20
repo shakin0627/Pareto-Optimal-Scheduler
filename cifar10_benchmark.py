@@ -17,7 +17,7 @@ from PIL import Image
 from torchvision.utils import make_grid
 
 from dpm_solver import NoiseScheduleVP, model_wrapper, DPM_Solver
-from opt_schedule import OptimalSchedule, _cost_functional
+from scheduling_born import OptimalSchedule, _cost_functional
 from diffusers import DDPMPipeline
 
 import lpips
@@ -209,7 +209,7 @@ def compute_fid(img_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--nfe",      type=int,   nargs="+", default=[12],
+    parser.add_argument("--nfe",      type=int,   nargs="+", default=[10],
                         help="NFE values to benchmark (must be even)")
     parser.add_argument("--n_images", type=int,   default=10000)
     parser.add_argument("--batch",    type=int,   default=16)
@@ -218,7 +218,7 @@ def main():
     parser.add_argument("--keep_imgs", action="store_true",
                         help="Keep generated PNGs after FID (default: delete)")
     # BornSchedule optimiser knobs
-    parser.add_argument("--max_iter", type=int,   default=10000)
+    parser.add_argument("--max_iter", type=int,   default=4000)
     parser.add_argument("--lr",       type=float, default=1e-2)
     parser.add_argument("--tol",      type=float, default=1e-7)
     args = parser.parse_args()

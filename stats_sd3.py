@@ -72,7 +72,6 @@ def _call_encode_prompt(pipe, prompts: list, device, dtype, max_seq: int):
         (prompt_embeds, negative_prompt_embeds,
          pooled_prompt_embeds, negative_pooled_prompt_embeds)
 
-    We only want the positive (first and third) entries.
     Returns (te, pe) on the same device, in the requested dtype.
     """
     with torch.no_grad():
@@ -325,34 +324,71 @@ def est_g_at_sigma(
     n_probes=4, delta=0.005,
 ) -> float:
     """
-    g(σ) = (1/d) Tr(∇_x v̂_CFG)  via FD-Hutchinson.
-    Efficient CFG version: v0_hat computed once outside probe loop;
-    each probe uses the same z for both null and cond branches.
-    Total: 2(1 + n_probes) forward passes per sample.
+    Returns (g_iso, g_sem, anisotropy_ratio) for SD3 / CFG models.
+ 
+    g_iso = (1/d) Tr(∇_x v̂_CFG)          isotropic FD-Hutchinson
+    g_sem = (1/d) u^T ∇_x v̂_CFG u        along CFG semantic direction
+            u = (v_cond – v_null) / ‖·‖
+ 
+    Forward budget per sample: 2 + n_probes + 2 = n_probes + 4
     """
-    trace = 0.0;  count = 0
+    from .stats_sd3 import single_vel   # adjust import to your package layout
+ 
+    trace_iso = 0.0
+    trace_sem = 0.0
+    count_iso = 0
+    count_sem = 0
+ 
     for xi in x0_list:
-        xi  = xi.unsqueeze(0) if xi.dim() == 3 else xi
+        xi = xi.unsqueeze(0) if xi.dim() == 3 else xi
         enc_cond, pool_cond = bank.sample(1)
         enc_null, pool_null = bank.null(1)
         noise = torch.randn_like(xi)
         xs    = (1.0 - sigma) * xi + sigma * noise
-        # baseline CFG velocity — computed once, reused for all probes
+ 
+        # baseline velocities
         v0_null = single_vel(tr, xs, sigma, enc_null, pool_null, h, w)
         v0_cond = single_vel(tr, xs, sigma, enc_cond, pool_cond, h, w)
         v0_hat  = (1.0 - cfg_scale) * v0_null + cfg_scale * v0_cond
+ 
+        # semantic direction u
+        u_raw = (cfg_scale * (v0_cond.float() - v0_null.float()))
+        u_norm = u_raw.norm()
+        if u_norm < 1e-8:
+            u_unit = torch.randn_like(u_raw)
+            u_unit = u_unit / (u_unit.norm() + 1e-8)
+        else:
+            u_unit = u_raw / u_norm
+ 
+        # isotropic probes
         for _ in range(n_probes):
             z      = torch.randn_like(xs)
             xs_p   = xs + delta * z
             vp_null = single_vel(tr, xs_p, sigma, enc_null, pool_null, h, w)
             vp_cond = single_vel(tr, xs_p, sigma, enc_cond, pool_cond, h, w)
             vp_hat  = (1.0 - cfg_scale) * vp_null + cfg_scale * vp_cond
-            trace  += float(((vp_hat.float() - v0_hat.float()) * z.float()).sum()) / delta
-            count  += 1
+            trace_iso += float(
+                ((vp_hat.float() - v0_hat.float()) * z.float()).sum()
+            ) / delta
+            count_iso += 1
             if xi.device.type == "cuda":
                 torch.cuda.empty_cache()
-    return trace / (count * d)
-
+ 
+        # semantic directional probe
+        xs_u    = xs + delta * u_unit
+        vp_null_u = single_vel(tr, xs_u, sigma, enc_null, pool_null, h, w)
+        vp_cond_u = single_vel(tr, xs_u, sigma, enc_cond, pool_cond, h, w)
+        vp_hat_u  = (1.0 - cfg_scale) * vp_null_u + cfg_scale * vp_cond_u
+        dv        = (vp_hat_u.float() - v0_hat.float()) / delta
+        trace_sem += float((dv * u_unit).sum())
+        count_sem += 1
+        if xi.device.type == "cuda":
+            torch.cuda.empty_cache()
+ 
+    g_iso  = trace_iso / (count_iso * d)
+    g_sem  = trace_sem / (count_sem * d)
+    ratio  = g_sem / (abs(g_iso) + 1e-8)
+    return g_iso, g_sem, ratio
 
 @torch.no_grad()
 def est_rho_eta(
@@ -368,9 +404,9 @@ def est_rho_eta(
     for xi in x0_list:
         xi   = xi.unsqueeze(0) if xi.dim() == 3 else xi
         errs = []
+        enc_cond, pool_cond = bank.sample(1)
+        enc_null, pool_null = bank.null(1)
         for s in sigma_grid:
-            enc_cond, pool_cond = bank.sample(1)
-            enc_null, pool_null = bank.null(1)
             noise  = torch.randn_like(xi)
             xs     = (1.0 - s) * xi + s * noise
             vstar  = noise - xi
@@ -406,13 +442,13 @@ def est_rho_vdot_fd1(
     for xi in x0_list:
         xi    = xi.unsqueeze(0) if xi.dim() == 3 else xi
         vdots = []
+        enc_cond, pool_cond = bank.sample(1)
+        enc_null, pool_null = bank.null(1)
         for s in sigma_grid:
             s_lo = max(0.0, s - dsigma);  s_hi = min(1.0, s + dsigma)
             ds   = (s_hi - s_lo) / 2.0
             if ds < 1e-6:
                 vdots.append(None);  continue
-            enc_cond, pool_cond = bank.sample(1)
-            enc_null, pool_null = bank.null(1)
             noise    = torch.randn_like(xi)
             xlo      = (1.0 - s_lo) * xi + s_lo * noise
             xhi      = (1.0 - s_hi) * xi + s_hi * noise
@@ -761,7 +797,7 @@ def run_estimation(args):
         x0_g = [x0_all[i] for i in range(n_g)]
         print(f"\n[stats_sd3] g(σ)  n_g={n_g}  n_probes={args.n_hutchinson} …")
         for k, s in enumerate(sg):
-            g_vals[k] = est_g_at_sigma(
+            g_vals[k], g_sem, ratio = est_g_at_sigma(
                 tr, s, x0_g, bank, h, w, d, cfg_scale,
                 n_probes=args.n_hutchinson, delta=args.g_delta,
             )

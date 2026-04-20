@@ -1,39 +1,9 @@
 """
 T2I-CompBench Generation Pipeline for BornSchedule
 ====================================================
-Generates images for all dataset configs × NFE values × schedules (born + uniform).
+Generates images for all dataset configs × NFE values × schedules.
 Evaluation is left as TODO stubs.
 
-Usage:
-    python generate_t2i_compbench.py \
-        --schedules_dir ./born_schedules \
-        --model_name black-forest-labs/FLUX.1-dev \
-        --out_dir ./outputs \
-        --seeds 42 \
-        --height 512 --width 512 \
-        --guidance_scale 3.5
-
-Expected layout of --schedules_dir:
-    born_schedules/
-        born_nfe5.npy
-        born_nfe10.npy
-        born_nfe25.npy
-        born_nfe50.npy
-    Each .npy is a descending sigma array of length NFE+1.
-    (Uniform schedules are derived automatically from the same [σ_max, σ_min].)
-
-Output layout:
-    outputs/
-        born_nfe10_color/
-            p0000_s42.png
-            p0001_s42.png
-            ...
-        uniform_nfe10_color/
-            ...
-        born_nfe10_shape/
-            ...
-        ...
-        progress_born_nfe10_color.json    ← per-run checkpoint
 """
 
 from __future__ import annotations
