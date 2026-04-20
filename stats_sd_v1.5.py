@@ -8,7 +8,7 @@ Usage:
       --model runwayml/stable-diffusion-v1-5 \\
       --cfg_scale 7.5 \\
       --n_lambda 60 --n_samples 256 --n_ell_samples 128 \\
-      --output_dir ~/.cache/opt_schedule
+      --output_dir /media/ssd_horse/keying/Pareto-Optimal-Scheduler/stats_sd_v1.5
 """
 
 import os
@@ -312,8 +312,7 @@ def est_score_corr(unet, t_indices, lambdas_dense, alphas, sigmas, d,
         errs = []
         enc_cond = bank.sample(1)
         enc_null = bank.null(1)
-        for t_idx in t_indices:
-            
+        for t_idx in t_indices:  
             eps_m    = torch.randn_like(xi)
             x_t      = float(alphas[t_idx]) * xi + float(sigmas[t_idx]) * eps_m
             eps_hat  = cfg_eps(unet, x_t, t_idx, enc_null, enc_cond, cfg_scale)
@@ -330,7 +329,7 @@ def est_score_corr(unet, t_indices, lambdas_dense, alphas, sigmas, d,
 
     C /= max(n, 1)
     diag = np.diag(C).clip(1e-30)
-    rho  = np.clip(C / np.sqrt(np.outer(diag, diag)), 1e-8, 1.0)
+    rho  = np.clip(C / np.sqrt(np.outer(diag, diag)), -1.0, 1.0)
 
     lams   = lambdas_dense.cpu().numpy()[t_indices]
     dl, rp = [], []
@@ -338,6 +337,14 @@ def est_score_corr(unet, t_indices, lambdas_dense, alphas, sigmas, d,
         for j in range(i + 1, M):
             dl.append(abs(lams[i] - lams[j]))
             rp.append(float(rho[i, j]))
+    eigvals = np.linalg.eigvalsh(C)
+    eigvals_sorted = np.sort(eigvals)[::-1]
+    total = np.sum(np.abs(eigvals_sorted)) + 1e-12
+
+    print("\n Score error Spectrum summary:")
+    print(f"  λ1 / sum(|λ|) = {eigvals_sorted[0] / total:.4f}")
+    print(f"  λ2 / λ1       = {eigvals_sorted[1] / eigvals_sorted[0]:.4f}")
+    print(f"  λ3 / λ1       = {eigvals_sorted[2] / eigvals_sorted[0]:.4f}")
     return C, rho, np.array(dl), np.array(rp)
 
 
@@ -483,13 +490,14 @@ def check_epsilon_validity(lambdas_grid, g_vals, nfe_list=(10, 20, 50)):
     Flags NFE settings that risk propagation-chain collapse.
     """
     import math
-    span = lambdas_grid[-1] - lambdas_grid[0]
-    g_mean = float(np.mean(np.abs(g_vals)))
-    print(f"\n  ── Born validity check (λ span={span:.2f}, mean|g|={g_mean:.3f}) ──")
+    span  = lambdas_grid[-1] - lambdas_grid[0]
+    g_eff = float(np.percentile(np.abs(g_vals[g_vals != 0]), 90)) \
+            if np.any(g_vals != 0) else 0.0
+    print(f"\n  ── Born validity check (λ span={span:.2f}, p90|g|={g_eff:.3f}) ──")
     print(f"  {'NFE':>5}  {'h_typ':>8}  {'|ε|_est':>9}  {'safe?':>10}")
     for nfe in nfe_list:
         h    = span / nfe
-        val  = math.exp(h / 2) * (1 - math.exp(-h)) * g_mean
+        val  = math.exp(h / 2) * (1 - math.exp(-h)) * g_eff
         safe = "✓ |ε|<<1" if val < 0.5 else ("~ marginal" if val < 1.0 else "✗ chain risk")
         print(f"  {nfe:>5}  {h:>8.4f}  {val:>9.4f}  {safe:>10}")
 
@@ -497,8 +505,7 @@ def check_epsilon_validity(lambdas_grid, g_vals, nfe_list=(10, 20, 50)):
 # ══════════════════════════════════════════════════════════════════════════════
 # Visualisation
 # ══════════════════════════════════════════════════════════════════════════════
-
-def _visualize(lambdas_grid, g_vals, s2_eta, s2_gpp,
+def _visualize(lambdas_grid, g_vals, g_sem_vals, g_ratio, s2_eta, s2_gpp,
                rho_s, rho_vals, rho_s_gpp, rho_vals_gpp,
                plateau_score, plateau_gpp,
                seg_bounds, seg_curves, cv_s, s_common, mean_cv, stat_verdict,
@@ -508,7 +515,7 @@ def _visualize(lambdas_grid, g_vals, s2_eta, s2_gpp,
     seg_colors = ["#e05c00", "#2d6a9f", "#2a7d4f", "#9b3fa0"]
 
     ax = fig.add_subplot(gs[0, 0])
-    ax.plot(lambdas_grid, g_vals, color="#2d6a9f", lw=2)
+    ax.plot(lambdas_grid, g_vals, color="#2d6a9f", lw=2, label="g_iso")
     ax.axhline(0, color="gray", lw=0.7, ls="--")
     ax.set_xlabel("λ"); ax.set_ylabel("g(λ)")
     ax.set_title(f"Scalar Jacobian Proxy  g(λ)\n[CFG w={cfg_scale}]")
@@ -527,7 +534,7 @@ def _visualize(lambdas_grid, g_vals, s2_eta, s2_gpp,
                    label=f"ρ_∞={plateau_score['rho_infty']:.3f}")
     ax.set_xlabel("|Δλ|"); ax.set_ylabel("ρ̂")
     ax.set_title("Score-Error Correlation ρ̂_η(s)")
-    ax.legend(fontsize=8); ax.set_ylim(-0.05, 1.05); ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8); ax.set_ylim(-0.15, 1.05); ax.grid(True, alpha=0.3)
 
     ax = fig.add_subplot(gs[1, 0])
     ax.plot(s_common, cv_s, color="#555", lw=2)
@@ -545,11 +552,26 @@ def _visualize(lambdas_grid, g_vals, s2_eta, s2_gpp,
         ax.plot(rs, rv, color=seg_colors[k % len(seg_colors)], lw=2,
                 label=f"λ̄∈[{lo:.1f},{hi:.1f})")
     ax.set_xlabel("|Δλ|"); ax.set_title("Per-Segment ρ̂_η(s)")
-    ax.legend(fontsize=8); ax.set_ylim(-0.05, 1.05); ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8); ax.set_ylim(-0.15, 1.05); ax.grid(True, alpha=0.3)
 
+    # ── gs[1,2]: anisotropy (replaces cost integrand) ──────────────────────
     ax = fig.add_subplot(gs[1, 2])
-    ax.plot(lambdas_grid, np.abs(g_vals) * s2_eta, color="#2a7d4f", lw=2)
-    ax.set_xlabel("λ"); ax.set_title("Cost Integrand  |g(λ)| · σ²_η(λ)")
+    has_g = np.any(g_vals != 0)
+    if has_g:
+        ax2 = ax.twinx()
+        ax.plot(lambdas_grid, g_vals,     color="#2d6a9f", lw=2,   label="g_iso")
+        ax.plot(lambdas_grid, g_sem_vals, color="#b5451b", lw=2,   label="g_sem", ls="--")
+        ax2.plot(lambdas_grid, g_ratio,   color="#2a7d4f", lw=1.5, label="ratio", ls=":")
+        ax2.axhline(1.0, color="#2a7d4f", lw=0.8, ls="--", alpha=0.5)
+        ax2.set_ylabel("g_sem / g_iso", color="#2a7d4f", fontsize=8)
+        ax2.tick_params(axis="y", labelcolor="#2a7d4f")
+        lines1, labs1 = ax.get_legend_handles_labels()
+        lines2, labs2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labs1 + labs2, fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "g not estimated\n(--no_g)", ha="center", va="center",
+                transform=ax.transAxes)
+    ax.set_xlabel("λ"); ax.set_title("Anisotropy  g_iso vs g_sem")
     ax.grid(True, alpha=0.3)
 
     ax = fig.add_subplot(gs[2, 0])
@@ -598,7 +620,6 @@ def _visualize(lambdas_grid, g_vals, s2_eta, s2_gpp,
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  [vis] saved → {out_path}")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main pipeline
@@ -694,21 +715,23 @@ def run_estimation(args):
     s2_gpp_sm = np.exp(savgol_filter(np.log(np.clip(s2_gpp, 1e-30, None)), wl, 2))
 
     # ── g(λ) ─────────────────────────────────────────────────────────────────
-    g_vals = np.zeros(n_lam)
+    g_iso_vals = np.zeros(n_lam)
+    g_sem_vals = np.zeros(n_lam)
+    g_ratio    = np.zeros(n_lam)
     if not args.no_g:
         n_g    = min(args.n_g_samples, args.n_samples)
         x0_g   = [x0_all[i] for i in range(n_g)]
         print(f"\n[stats_sd15] g(λ)  n_g={n_g}  n_probes={args.n_hutchinson} …")
         for k, (t_idx, lam) in enumerate(zip(t_indices, lambdas_grid)):
-            g_vals[k], g_sem, ratio = est_g_at_t(unet, t_idx,
+            g_iso_vals[k], g_sem_vals[k], g_ratio[k] = est_g_at_t(unet, t_idx,
                                     float(alphas[t_idx]), float(sigmas[t_idx]),
                                     d, x0_g, bank, args.cfg_scale,
                                     n_probes=args.n_hutchinson, delta=args.g_delta)
             if (k + 1) % max(1, n_lam // 8) == 0:
-                print(f"  g  {k+1}/{n_lam}  λ={lam:.3f}  g={g_vals[k]:.5f}")
+                print(f"  g  {k+1}/{n_lam}  λ={lam:.3f}  g={g_iso_vals[k]:.5f}")
 
     # ── Born validity check ───────────────────────────────────────────────────
-    check_epsilon_validity(lambdas_grid, g_vals, nfe_list=(10, 20, 50))
+    check_epsilon_validity(lambdas_grid, g_iso_vals, nfe_list=(10, 20, 50))
 
     # ── Score-error correlation ───────────────────────────────────────────────
     n_ell  = min(args.n_ell_samples, args.n_samples)
@@ -772,7 +795,7 @@ def run_estimation(args):
 
     save = dict(
         lambda_grid       = lambdas_grid.astype(np.float32),
-        g_values          = g_vals.astype(np.float32),
+        g_values          = g_iso_vals.astype(np.float32),
         sigma2_values     = s2_eta.astype(np.float32),
         sigma2_gpp_values = s2_gpp_sm.astype(np.float32),
         lambda_min        = np.float32(lambda_min),
@@ -781,6 +804,11 @@ def run_estimation(args):
         rho_values        = rho_vals.astype(np.float32),
         cfg_scale         = np.float32(args.cfg_scale),
     )
+    save.update(dict(
+        g_iso_values = g_iso_vals.astype(np.float32),
+        g_sem_values = g_sem_vals.astype(np.float32),
+        g_ratio      = g_ratio.astype(np.float32),
+    ))
     if rho_s_gpp is not None:
         save["rho_s_gpp"]      = rho_s_gpp.astype(np.float32)
         save["rho_values_gpp"] = rho_vals_gpp.astype(np.float32)
@@ -788,7 +816,7 @@ def run_estimation(args):
     np.savez(str(npz), **save)
     print(f"\n[stats_sd15] saved → {npz}")
 
-    _visualize(lambdas_grid, g_vals, s2_eta, s2_gpp_sm,
+    _visualize(lambdas_grid, g_iso_vals, g_sem_vals, g_ratio, s2_eta, s2_gpp_sm,
                rho_s, rho_vals, rho_s_gpp, rho_vals_gpp,
                plateau_score, plateau_gpp,
                seg_bounds, seg_curves, cv_s, s_common, mean_cv, stat_verdict,
