@@ -1,0 +1,126 @@
+"""
+diagnostic_main.py  — compare n_restarts=1 vs 3 under fixed seed & cosine init.
+Usage:  python diagnostic_main.py --npz your.npz --nfe 10
+"""
+
+import argparse, sys
+import numpy as np
+from flux_schedule import (
+    _load_stats, _cosine_alpha_init, _alpha_to_sigmas,
+    _grad_alpha, _cost_functional,
+)
+
+# ─────────────────────────────────────────────────────────
+# bare Adam loop (mirrors optimize_schedule exactly)
+# ─────────────────────────────────────────────────────────
+def run_adam(alpha_init, sigma_max, sigma_min, cost_kw,
+              n_steps=2000, lr=1e-3, lr_decay=0.995, fd_h=1e-3,
+              tag=""):
+    alpha = alpha_init.copy()
+    m = np.zeros_like(alpha)
+    v = np.zeros_like(alpha)
+    β1, β2, ε_a = 0.9, 0.999, 1e-8
+    lr_t = lr
+    plateau_count = 0
+    cost_prev = float("inf")
+
+    for step in range(1, n_steps + 1):
+        g_vec = _grad_alpha(alpha, sigma_max, sigma_min, fd_h, **cost_kw)
+        m     = β1 * m + (1 - β1) * g_vec
+        v     = β2 * v + (1 - β2) * g_vec ** 2
+        alpha -= lr_t * (m / (1 - β1**step)) / (np.sqrt(v / (1 - β2**step)) + ε_a)
+        lr_t  *= lr_decay
+
+        sigmas = _alpha_to_sigmas(alpha, sigma_max, sigma_min)
+        cost   = _cost_functional(sigmas, **cost_kw)
+
+        rel = abs(cost_prev - cost) / (abs(cost_prev) + 1e-12)
+        plateau_count = (plateau_count + 1) if rel < 1e-7 else 0
+        if plateau_count > 50:
+            print(f"  {tag} early-stop @ step {step}  cost={cost:.4e}")
+            break
+        cost_prev = cost
+
+    sigmas = _alpha_to_sigmas(alpha, sigma_max, sigma_min)
+    cost   = _cost_functional(sigmas, **cost_kw)
+    return sigmas, cost
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--npz", required=True)
+    p.add_argument("--nfe", type=int, default=10)
+    p.add_argument("--n_steps", type=int, default=2000)
+    p.add_argument("--noise_scale", type=float, default=0.5,
+                   help="std of perturbation added in restart>0")
+    args = p.parse_args()
+
+    np.random.seed(42)  # fix ALL randomness globally
+
+    (sigma2_fn, sigma2_vdot_fn, g_fn,
+     phi_res, rho_infty, sigma_max, sigma_min,
+     C_rho_eta, C_rho_d) = _load_stats(args.npz)
+
+    cost_kw = dict(
+        g_fn=g_fn, sigma2_fn=sigma2_fn, sigma2_vdot_fn=sigma2_vdot_fn,
+        phi_res_fn=phi_res, rho_infty=rho_infty,
+        C_rho_eta=C_rho_eta, C_rho_d=C_rho_d, n_quad=32,
+        w_rank1=1.0, w_vres=1.0, w_disc=1.0,
+    )
+
+    cosine_alpha = _cosine_alpha_init(args.nfe, sigma_max, sigma_min)
+
+    print(f"\n{'='*60}")
+    print(f"NFE={args.nfe}  σ∈[{sigma_min:.4f},{sigma_max:.4f}]  seed=42")
+    print(f"{'='*60}")
+
+    # ── n_restarts = 1 ──────────────────────────────────────────
+    print("\n[n_restarts=1]")
+    np.random.seed(42)
+    s1, c1 = run_adam(cosine_alpha, sigma_max, sigma_min, cost_kw,
+                      n_steps=args.n_steps, tag="r0")
+    print(f"  cost   = {c1:.6e}")
+    print(f"  sigmas = {np.round(s1, 4).tolist()}")
+    h1 = s1[:-1] - s1[1:]
+    print(f"  h      = {np.round(h1, 4).tolist()}")
+    print(f"  h_cv   = {h1.std()/h1.mean():.4f}")
+
+    # ── n_restarts = 3 ──────────────────────────────────────────
+    print("\n[n_restarts=3]  (restart 0 = same cosine; 1,2 = cosine + noise)")
+    np.random.seed(42)
+    best_cost, best_s = float("inf"), None
+    restart_results = []
+
+    for r in range(3):
+        alpha_init = cosine_alpha.copy()
+        if r > 0:
+            noise = np.random.randn(args.nfe) * args.noise_scale
+            alpha_init += noise
+            print(f"\n  restart {r}  noise={np.round(noise,3).tolist()}")
+        else:
+            print(f"\n  restart {r}  (clean cosine init)")
+
+        s, c = run_adam(alpha_init, sigma_max, sigma_min, cost_kw,
+                        n_steps=args.n_steps, tag=f"r{r}")
+        restart_results.append((r, c, s))
+        winner = "★ NEW BEST" if c < best_cost else "  (not best)"
+        print(f"  cost   = {c:.6e}  {winner}")
+        print(f"  sigmas = {np.round(s, 4).tolist()}")
+        h = s[:-1] - s[1:]
+        print(f"  h_cv   = {h.std()/h.mean():.4f}")
+        if c < best_cost:
+            best_cost, best_s = c, s.copy()
+
+    # ── Δ analysis ───────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"SUMMARY")
+    print(f"{'='*60}")
+    print(f"  n_restarts=1  cost={c1:.6e}  sigmas={np.round(s1,4).tolist()}")
+    print(f"  n_restarts=3  cost={best_cost:.6e}  sigmas={np.round(best_s,4).tolist()}")
+    print(f"\n  Δcost (3-1)  = {best_cost - c1:+.4e}"
+          f"  ({'3 wins' if best_cost < c1 else '1 wins' if c1 < best_cost else 'tie'})")
+    print(f"  max |Δσ|     = {np.abs(best_s - s1).max():.4f}")
+    print(f"\n  Per-restart costs:")
+    for r, c, _ in restart_results:
+        diff = f"Δ={c-c1:+.3e} vs r=1"
+        print(f"    restart {r}: {c:.6e}  {diff}")
